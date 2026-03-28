@@ -209,3 +209,6 @@ __marimo__/
 # Markdown files (except README.md)
 *.md
 !README.md
+
+# Atlassian credentials
+profiles.json

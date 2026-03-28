@@ -1,0 +1,19 @@
+{
+  "default": "personal",
+  "profiles": {
+    "personal": {
+      "jira_url":      "https://sbharatllm.atlassian.net",
+      "email":         "sbharat.llm@gmail.com",
+      "token":         "your-api-token-here",
+      "client_id":     "",
+      "client_secret": ""
+    },
+    "work": {
+      "jira_url":      "https://yourcompany.atlassian.net",
+      "email":         "you@yourcompany.com",
+      "token":         "your-api-token-here",
+      "client_id":     "",
+      "client_secret": ""
+    }
+  }
+}
