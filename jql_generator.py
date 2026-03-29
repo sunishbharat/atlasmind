@@ -16,6 +16,7 @@ Prompt engineering follows the Jira-Whisperer pattern:
 """
 
 import asyncio
+import logging
 import os
 import re
 from abc import ABC, abstractmethod
@@ -28,6 +29,8 @@ from fastmcp.client.transports import StreamableHttpTransport
 
 from jql_reference import JQL_REFERENCE
 from jql_examples import ExampleStore, find_examples, example_count
+
+logger = logging.getLogger(__name__)
 
 # Condensed reference for smaller/local models — covers the most common mistakes
 _JQL_QUICK_REFERENCE = """
@@ -153,25 +156,25 @@ class LocalLLMGenerator(JQLGenerator):
         self.example_store = ExampleStore(path=examples_file, folder=examples_folder)
 
     async def health_check(self) -> bool:
-        print(f"Checking Ollama ({self.base_url}, model: {self.model})...")
+        logger.info("Checking Ollama (%s, model: %s)...", self.base_url, self.model)
         try:
             async with httpx.AsyncClient(timeout=10) as client:
                 r = await client.get(f"{self.base_url}/api/tags")
                 r.raise_for_status()
                 models = [m["name"] for m in r.json().get("models", [])]
                 if self.model in models:
-                    print(f"  Ollama is UP — model '{self.model}' is available.")
+                    logger.info("Ollama is UP - model '%s' is available.", self.model)
                     n = self.example_store.count()
                     if n:
-                        print(f"  JQL example dataset: {n} queries loaded from {self.example_store.source_desc()}.")
+                        logger.info("JQL example dataset: %d queries loaded from %s.", n, self.example_store.source_desc())
                     else:
-                        print(f"  JQL example dataset: none loaded ({self.example_store.source_desc()}).")
+                        logger.info("JQL example dataset: none loaded (%s).", self.example_store.source_desc())
                     return True
                 available = ", ".join(models) or "none"
-                print(f"  Ollama is UP but model '{self.model}' not found. Available: {available}")
+                logger.warning("Ollama is UP but model '%s' not found. Available: %s", self.model, available)
                 return False
         except Exception as e:
-            print(f"  Ollama is UNREACHABLE: {e}")
+            logger.error("Ollama is UNREACHABLE: %s", e)
             return False
 
     async def generate(self, natural_language: str, profile=None) -> str:
@@ -181,7 +184,7 @@ class LocalLLMGenerator(JQLGenerator):
             try:
                 metadata = await fetch_metadata(profile)
             except Exception as e:
-                print(f"  [warn] Could not fetch Jira metadata for prompt context: {e}")
+                logger.warning("Could not fetch Jira metadata for prompt context: %s", e)
 
         prompt = _build_prompt(natural_language, metadata, example_store=self.example_store)
 
@@ -199,14 +202,14 @@ class LocalLLMGenerator(JQLGenerator):
             jql = response.json()["message"]["content"].strip()
 
         jql = _clean_jql(jql)
-        print(f"  [JQL generated] {jql}")
+        logger.info("JQL generated: %s", jql)
 
         # Validate and auto-correct (enabled by default for local LLMs)
         if self.validate and metadata:
             result = validate_and_fix(jql, metadata)
             if result.changes:
-                print(f"  [JQL auto-corrected] {result.changes}")
-                print(f"  [JQL final]          {result.fixed_jql}")
+                logger.info("JQL auto-corrected: %s", result.changes)
+                logger.info("JQL final: %s", result.fixed_jql)
             jql = result.fixed_jql
 
         return jql
@@ -225,7 +228,7 @@ class RovoMCPGenerator(JQLGenerator):
         self.validate     = validate
 
     async def health_check(self) -> bool:
-        print(f"Checking Rovo MCP server ({self.ROVO_MCP_URL})...")
+        logger.info("Checking Rovo MCP server (%s)...", self.ROVO_MCP_URL)
         try:
             transport = StreamableHttpTransport(
                 url=self.ROVO_MCP_URL,
@@ -233,12 +236,12 @@ class RovoMCPGenerator(JQLGenerator):
             )
             async with Client(transport) as client:
                 tools = await client.list_tools()
-                print(f"  Rovo MCP is UP — {len(tools)} tool(s) available:")
+                logger.info("Rovo MCP is UP - %d tool(s) available:", len(tools))
                 for t in tools:
-                    print(f"    - {t.name}")
+                    logger.info("  - %s", t.name)
                 return True
         except Exception as e:
-            print(f"  Rovo MCP is UNREACHABLE: {e}")
+            logger.error("Rovo MCP is UNREACHABLE: %s", e)
             return False
 
     async def generate(self, natural_language: str, profile=None) -> str:
@@ -316,7 +319,15 @@ def _clean_jql(text: str) -> str:
 
 if __name__ == "__main__":
     import argparse
+    import sys
     from config import get_profile
+
+    logging.basicConfig(
+        stream=sys.stdout,
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        encoding="utf-8",
+    )
 
     parser = argparse.ArgumentParser(description="Test JQL generation")
     parser.add_argument("--backend", choices=["local", "rovo"], default=None)
@@ -327,10 +338,10 @@ if __name__ == "__main__":
     async def main():
         profile   = get_profile(args.profile)
         generator = get_generator(args.backend)
-        print(f"Backend : {type(generator).__name__}")
-        print(f"Profile : {profile.name}")
-        print(f"Query   : {args.query}")
+        logger.info("Backend : %s", type(generator).__name__)
+        logger.info("Profile : %s", profile.name)
+        logger.info("Query   : %s", args.query)
         jql = await generator.generate(args.query, profile=profile)
-        print(f"JQL     : {jql}")
+        logger.info("JQL     : %s", jql)
 
     asyncio.run(main())

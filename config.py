@@ -12,6 +12,7 @@ Selection priority (highest first):
 """
 
 import json
+import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -19,6 +20,8 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 load_dotenv()
+
+logger = logging.getLogger(__name__)
 
 PROFILES_FILE = Path(__file__).parent / "profiles.json"
 
@@ -112,16 +115,20 @@ def print_profiles():
     profiles = data.get("profiles", {})
     default  = data.get("default", next(iter(profiles), ""))
 
-    print(f"{'Profile':<15} {'Jira URL':<45} {'Email':<35} Default")
-    print("-" * 105)
+    logger.info("%-15s %-45s %-35s %s", "Profile", "Jira URL", "Email", "Default")
+    logger.info("-" * 105)
     for name, raw in profiles.items():
         is_default = "  ✓" if name == default else ""
-        token_set  = "set" if raw.get("token") else "env/unset"
-        print(
-            f"{name:<15} {raw.get('jira_url',''):<45} "
-            f"{raw.get('email',''):<35} {is_default}"
+        logger.info(
+            "%-15s %-45s %-35s %s",
+            name, raw.get("jira_url", ""), raw.get("email", ""), is_default,
         )
 
 
 if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        encoding="utf-8",
+    )
     print_profiles()

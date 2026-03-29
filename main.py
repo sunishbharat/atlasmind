@@ -1,5 +1,6 @@
 import argparse
 import asyncio
+import logging
 import re
 import sys
 from typing import NamedTuple
@@ -11,6 +12,8 @@ from config_fields import (
     POST_FILTER_PATTERNS, POST_FILTER_FETCH_MULTIPLIER,
 )
 from jql_generator import get_generator
+
+logger = logging.getLogger(__name__)
 
 
 class PostFilter(NamedTuple):
@@ -168,6 +171,13 @@ def parse_args():
 
 
 def main():
+    logging.basicConfig(
+        stream=sys.stdout,
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        encoding="utf-8",
+    )
+
     args = parse_args()
 
     if args.list_profiles:
@@ -182,20 +192,19 @@ def main():
         examples_folder = args.examples_folder,
     )
 
-    print(f"Profile : {profile.name} — {profile.jira_base_url} ({profile.email})")
-    print(f"Backend : {type(generator).__name__}\n")
+    logger.info("Profile : %s - %s (%s)", profile.name, profile.jira_base_url, profile.email)
+    logger.info("Backend : %s", type(generator).__name__)
 
     # Health check for the selected backend only
     ok = asyncio.run(generator.health_check())
-    print()
     if not ok:
-        print("Backend is not available. Exiting.")
+        logger.error("Backend is not available. Exiting.")
         sys.exit(1)
 
     # Generate JQL from natural language
-    print(f"Query         : {args.query}")
+    logger.info("Query         : %s", args.query)
     jql = asyncio.run(generator.generate(args.query, profile=profile))
-    print(f"Generated JQL : {jql}\n")
+    logger.info("Generated JQL : %s", jql)
 
     # Run JQL against Jira
     limit        = _parse_limit(args.query)

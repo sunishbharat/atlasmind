@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import logging
 import os
 import webbrowser
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -14,6 +15,8 @@ from config import Profile, get_profile
 from config_fields import FIELD_META, DEFAULT_DISPLAY_FIELDS, COMPUTED_FIELD_DEPS, POST_FILTER_FETCH_MULTIPLIER
 
 load_dotenv()
+
+logger = logging.getLogger(__name__)
 
 # ── MCP config ──────────────────────────────────────────────────────
 ROVO_MCP_URL = "https://mcp.atlassian.com/v1/mcp"
@@ -63,8 +66,8 @@ def get_oauth_token(profile: Profile) -> str:
     session = OAuth2Session(profile.client_id, scope=SCOPES, redirect_uri=REDIRECT_URI)
     auth_url, _ = session.authorization_url(AUTH_URL, audience="api.atlassian.com")
 
-    print(f"Opening browser for Atlassian authorization...")
-    print(f"If the browser does not open, visit:\n  {auth_url}\n")
+    logger.info("Opening browser for Atlassian authorization...")
+    logger.info("If the browser does not open, visit:\n  %s", auth_url)
     webbrowser.open(auth_url)
 
     token = session.fetch_token(
@@ -74,7 +77,7 @@ def get_oauth_token(profile: Profile) -> str:
     )
     access_token = token["access_token"]
     set_key(ENV_FILE, "ATLASSIAN_OAUTH_TOKEN", access_token)
-    print("OAuth token obtained and cached in .env\n")
+    logger.info("OAuth token obtained and cached in .env")
     return access_token
 
 
@@ -103,16 +106,15 @@ async def check_rovo_mcp(profile: Profile, bearer_token: str | None = None):
     transport   = _transport_bearer(bearer_token) if bearer_token else _transport_basic(profile)
     auth_method = "OAuth 2.1" if bearer_token else "Basic Auth"
 
-    print(f"Checking Rovo MCP server ({auth_method}) for profile '{profile.name}'...")
+    logger.info("Checking Rovo MCP server (%s) for profile '%s'...", auth_method, profile.name)
     try:
         async with Client(transport) as client:
             tools = await client.list_tools()
-            print(f"  Server is UP — {len(tools)} tool(s) available:")
+            logger.info("Server is UP - %d tool(s) available:", len(tools))
             for t in tools:
-                print(f"    - {t.name}")
+                logger.info("  - %s", t.name)
     except Exception as e:
-        print(f"  Server is UNREACHABLE: {e}")
-    print()
+        logger.warning("Server is UNREACHABLE: %s", e)
 
 
 # ── Jira REST API ───────────────────────────────────────────────────
@@ -198,7 +200,7 @@ async def atlasmind(
             )
 
         if not response.is_success:
-            print(f"Error {response.status_code}: {response.text[:200]}")
+            logger.error("HTTP %d: %s", response.status_code, response.text[:200])
         response.raise_for_status()
         data = response.json()
 
@@ -218,32 +220,40 @@ async def atlasmind(
     cols.append(("Summary", 0, lambda issue: issue["fields"].get("summary", "")))
 
     # ── Header ──────────────────────────────────────────────────────
-    print(f"Profile : {profile.name}  ({profile.jira_base_url})")
-    print(f"JQL     : {jql_query}")
+    logger.info("Profile : %s  (%s)", profile.name, profile.jira_base_url)
+    logger.info("JQL     : %s", jql_query)
     if post_filters:
         descs = [f"{pf.field} {pf.operator} {pf.threshold}" for pf in post_filters]
-        print(f"Filter  : {' AND '.join(descs)}  (applied in Python after fetch)")
-    print(f"Found {total} issue(s) in Jira, showing {len(issues)} (examined {examined}):\n")
+        logger.info("Filter  : %s  (applied in Python after fetch)", " AND ".join(descs))
+    logger.info("Found %d issue(s) in Jira, showing %d (examined %d):", total, len(issues), examined)
 
     header = "".join(label.ljust(width) for label, width, _ in cols[:-1]) + cols[-1][0]
     total_width = max(80, len(header) + 10)
-    print(header)
-    print("-" * total_width)
+    logger.info(header)
+    logger.info("-" * total_width)
 
     for issue in issues:
         row = "".join(str(fn(issue))[:width].ljust(width) for _, width, fn in cols[:-1])
         row += str(cols[-1][2](issue))
-        print(row)
+        logger.info(row)
 
-    print("-" * total_width)
+    logger.info("-" * total_width)
     if post_filters:
-        print(f"Retrieved {len(issues)} matching issue(s) "
-              f"(examined {examined} of {total} total; post-filter applied).")
+        logger.info(
+            "Retrieved %d matching issue(s) (examined %d of %d total; post-filter applied).",
+            len(issues), examined, total,
+        )
     else:
-        print(f"Retrieved {len(issues)} of {total} total issue(s).")
+        logger.info("Retrieved %d of %d total issue(s).", len(issues), total)
 
 
 if __name__ == "__main__":
+    logging.basicConfig(
+        stream=__import__("sys").stdout,
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        encoding="utf-8",
+    )
     profile = get_profile()
     asyncio.run(check_rovo_mcp(profile))
     asyncio.run(atlasmind(profile))
