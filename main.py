@@ -1,9 +1,14 @@
 import argparse
 import asyncio
 import logging
+import os
 import re
 import sys
+from pathlib import Path
 from typing import NamedTuple
+
+import httpx
+from sentence_transformers import SentenceTransformer
 
 from atlasmind import atlasmind, MAX_RESULTS
 from config import get_profile, print_profiles
@@ -11,19 +16,125 @@ from config_fields import (
     DEFAULT_DISPLAY_FIELDS, FIELD_META, QUERY_FIELD_MAP,
     POST_FILTER_PATTERNS, POST_FILTER_FETCH_MULTIPLIER,
 )
-from jql_generator import get_generator
+from settings import OLLAMA_URL, OLLAMA_MODEL, OLLAMA_TEMPERATURE, DEFAULT_ANNOTATION_FILE
+
+sys.path.insert(0, str(Path(__file__).parent / "src"))
+from document_processor_test import update_pgvector_from_annotations, test_embeddings_jql
+from jql_annotation_parser import parse_jql_annotations
 
 logger = logging.getLogger(__name__)
 
 
 class PostFilter(NamedTuple):
-    field:     str   # e.g. "days_to_fix"
-    operator:  str   # ">", ">=", "<", "<="
-    threshold: int   # canonical value (days)
+    field:     str
+    operator:  str
+    threshold: int
 
+
+# ── DB bootstrap ─────────────────────────────────────────────────────
+
+def load_annotations_into_db(annotation_file: str) -> SentenceTransformer:
+    """Parse annotation file and load (comment, jql, embedding) rows into pgvector."""
+    path = Path(annotation_file)
+    if not path.exists():
+        raise FileNotFoundError(f"Annotation file not found: {path}")
+    pairs = parse_jql_annotations(str(path))
+    logger.info("Loaded %d annotation pairs from %s", len(pairs), path.name)
+    model = update_pgvector_from_annotations(pairs)
+    return model
+
+
+# ── JQL generation ───────────────────────────────────────────────────
+
+def _build_prompt(query: str, examples: list[tuple]) -> str:
+    example_block = "\n\n".join(
+        f"-- {annotation}\n{jql}"
+        for _, annotation, jql, _ in examples
+    )
+    return (
+        f"You are a Jira JQL expert. Use the examples below as references. "
+        f"Each example is in the format '-- <annotation>\\n<jql>'. "
+        f"Generate a single valid JQL statement for the user's request using these rules:\n"
+        f"- Do not use placeholder values like 'ProjectName' or 'USERNAME'.\n"
+        f"- If no specific project is mentioned, omit the project filter.\n"
+        f"- Do NOT use date arithmetic between two fields. JQL does not support this.\n"
+        f"  INVALID: resolutiondate >= created + 20d\n"
+        f"  INVALID: resolutiondate - created > 20d\n"
+        f"  CORRECT: project = ZOOKEEPER AND resolution IS NOT EMPTY ORDER BY resolutiondate DESC\n"
+        f"  (duration filtering like 'took more than N days' is handled separately — omit it from JQL)\n"
+        f"- Do NOT append LIMIT — result count is controlled externally.\n"
+        f"- Output only the JQL — no explanation, no markdown, no comments.\n\n"
+        f"Examples:\n{example_block}\n\n"
+        f"User request: {query}\n"
+        f"JQL:"
+    )
+
+
+async def generate_jql(query: str, model: SentenceTransformer) -> str:
+    """Retrieve top-5 similar examples from pgvector then ask Ollama to generate JQL."""
+    examples, _ = test_embeddings_jql(query, model)
+    if not examples:
+        raise RuntimeError("No examples found in pgvector — was the DB loaded?")
+
+    prompt = _build_prompt(query, examples)
+    logger.debug("Ollama prompt:\n%s", prompt)
+
+    async with httpx.AsyncClient(timeout=60) as client:
+        response = await client.post(
+            f"{OLLAMA_URL}/api/generate",
+            json={"model": OLLAMA_MODEL, "prompt": prompt, "stream": False, "options": {"temperature": OLLAMA_TEMPERATURE}},
+        )
+        response.raise_for_status()
+        jql = response.json()["response"].strip()
+
+    # Strip any accidental markdown fences
+    jql = re.sub(r"^```[a-z]*\n?", "", jql, flags=re.IGNORECASE).strip("`").strip()
+    return jql
+
+
+def _remove_field_arithmetic(jql: str) -> str:
+    """Remove unsupported field-to-field date arithmetic from JQL.
+
+    JQL does not support arithmetic between two fields. The LLM produces two forms:
+      - resolutiondate >= created + 20d
+      - resolutiondate - created > 20d
+    Both are stripped so the query remains valid. Duration filtering is handled
+    by the days_to_fix post-filter in Python.
+    """
+    # Form A: field >= otherfield + Nd  /  field <= otherfield - Nd
+    jql = re.sub(
+        r"(?:AND\s+|OR\s+)?\w+\s*[><=!]+\s*\w+\s*[+\-]\s*\d+[smhdwMy]\b",
+        "", jql, flags=re.IGNORECASE,
+    )
+    # Form B: field - otherfield > Nd  /  field + otherfield < Nd
+    jql = re.sub(
+        r"(?:AND\s+|OR\s+)?\w+\s*[+\-]\s*\w+\s*[><=!]+\s*\d+[smhdwMy]\b",
+        "", jql, flags=re.IGNORECASE,
+    )
+    # Clean up empty parentheses left after clause removal e.g. "AND ()"
+    jql = re.sub(r"(?:AND\s+|OR\s+)?\(\s*\)", "", jql, flags=re.IGNORECASE)
+    # Clean up orphaned AND / OR at start or end
+    jql = re.sub(r"^\s*(?:AND|OR)\s+", "", jql, flags=re.IGNORECASE)
+    jql = re.sub(r"\s+(?:AND|OR)\s*$", "", jql, flags=re.IGNORECASE)
+    return jql.strip()
+
+
+def _sanitize_jql(jql: str) -> tuple[str, int | None]:
+    """Clean LLM-generated JQL and extract maxResults limit.
+
+    Applies _remove_field_arithmetic then strips any SQL-style LIMIT clause,
+    returning it as the maxResults value for the API call.
+    """
+    jql = _remove_field_arithmetic(jql)
+    m = re.search(r"\s+LIMIT\s+(\d+)\s*$", jql, flags=re.IGNORECASE)
+    if m:
+        return jql[:m.start()].strip(), int(m.group(1))
+    return jql, None
+
+
+# ── Query helpers ────────────────────────────────────────────────────
 
 def _detect_fields(query: str) -> list[str]:
-    """Return ordered list of Jira field names referenced in the query (max 9, summary added by atlasmind)."""
     seen: list[str] = []
     for pattern, field in QUERY_FIELD_MAP:
         if re.search(pattern, query, re.IGNORECASE) and field not in seen:
@@ -38,24 +149,22 @@ def _detect_fields(query: str) -> list[str]:
 
 
 def _parse_limit(query: str) -> int:
-    """Extract a numeric limit from the natural language query, or return MAX_RESULTS."""
+    # Explicit record-count patterns only — avoid grabbing numbers that belong
+    # to filter conditions like "more than 20 days" or "last 7 days".
     m = re.search(r'\b(\d+)\s+issue', query, re.IGNORECASE)
     if not m:
         m = re.search(r'\b(?:top|first|last|show|list|get|fetch)\s+(\d+)\b', query, re.IGNORECASE)
-    if not m:
-        m = re.search(r'\b(\d+)\b', query)
     return int(m.group(1)) if m else MAX_RESULTS
 
 
 def _detect_post_filters(query: str) -> list[PostFilter]:
-    """Detect time-based constraints that JQL cannot express and return them as PostFilters."""
     filters: list[PostFilter] = []
     seen: set[PostFilter] = set()
     for pattern, field_name, operator, unit_map in POST_FILTER_PATTERNS:
         m = pattern.search(query)
         if m:
             quantity  = int(m.group(1))
-            unit_stem = m.group(2).lower().rstrip("s")   # "days"→"day", "weeks"→"week"
+            unit_stem = m.group(2).lower().rstrip("s")
             threshold = quantity * unit_map.get(unit_stem, 1)
             pf = PostFilter(field=field_name, operator=operator, threshold=threshold)
             if pf not in seen:
@@ -64,109 +173,37 @@ def _detect_post_filters(query: str) -> list[PostFilter]:
     return filters
 
 
-_DESCRIPTION = """\
-AtlasMind — Query Jira using natural language.
-
-Converts a plain-English question into JQL, runs it against a configured
-Jira instance, and displays the results.
-
-Examples:
-  uv run python main.py --query "list open bugs in KAFKA"
-  uv run python main.py --query "show 20 critical issues updated this week"
-  uv run python main.py --profile personal --query "my unresolved tasks"
-  uv run python main.py --backend rovo --query "all blockers assigned to me"
-  uv run python main.py --examples-file data/my_queries.json --query "open issues"
-  uv run python main.py --list-profiles
-"""
-
-_EPILOG = """\
-Environment variables (all overridden by the corresponding CLI flag):
-  ATLASMIND_PROFILE     Default profile name (same as --profile)
-  JQL_BACKEND           Default backend: 'local' or 'rovo' (same as --backend)
-  JQL_LOCAL_MODEL       Ollama model name  (default: qwen2.5-coder:7b-instruct)
-  JQL_OLLAMA_URL        Ollama base URL    (default: http://localhost:11434)
-  JQL_EXAMPLES_FOLDER   Path to folder of JQL examples files (default: data/)
-  JQL_EXAMPLES_FILE     Path to a single JQL examples file (same as --examples-file)
-  ATLASSIAN_OAUTH_TOKEN OAuth 2.1 bearer token required for the 'rovo' backend
-  ATLASSIAN_TOKEN       Fallback Jira API token (used when not set per-profile)
-
-Profile configuration:
-  Profiles are stored in profiles.json (gitignored).
-  Copy profiles.json.example → profiles.json and fill in your credentials.
-  Each profile supports: jira_url, email, token, client_id, client_secret,
-  jira_type ('cloud' | 'server').
-
-JQL examples file formats (--examples-file):
-  .md   Markdown with ```jql blocks; entries prefixed "-- N. Description"
-  .json [{"description": "...", "jql": "..."}]  or  [["desc", "jql"], ...]
-  .csv  Two columns: description, jql  (header row optional)
-"""
-
+# ── CLI ──────────────────────────────────────────────────────────────
 
 def parse_args():
     parser = argparse.ArgumentParser(
         prog="atlasmind",
-        description=_DESCRIPTION,
-        epilog=_EPILOG,
+        description="AtlasMind — Query Jira using natural language via local Ollama LLM.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-
-    query_group = parser.add_argument_group("query options")
-    query_group.add_argument(
+    parser.add_argument(
         "--query", default="list all open issues", metavar="TEXT",
-        help=(
-            "Natural language question to convert to JQL and run against Jira. "
-            "The result limit is inferred from the query (e.g. 'list 20 issues' → 20); "
-            f"defaults to {MAX_RESULTS} when no number is mentioned. "
-            "(default: 'list all open issues')"
-        ),
+        help="Natural language question to convert to JQL and run against Jira.",
     )
-
-    profile_group = parser.add_argument_group("profile & connection options")
-    profile_group.add_argument(
+    parser.add_argument(
         "--profile", default=None, metavar="NAME",
-        help=(
-            "Atlassian profile to use, as defined in profiles.json. "
-            "Overrides ATLASMIND_PROFILE env var. "
-            "Run --list-profiles to see available profiles."
-        ),
+        help="Atlassian profile to use (from profiles.json). Run --list-profiles to see options.",
     )
-    profile_group.add_argument(
+    parser.add_argument(
         "--list-profiles", action="store_true",
         help="List all configured profiles and exit.",
     )
-
-    backend_group = parser.add_argument_group("JQL generation backend options")
-    backend_group.add_argument(
-        "--backend", choices=["local", "rovo"], default=None, metavar="{local,rovo}",
+    parser.add_argument(
+        "--annotation-file", default=DEFAULT_ANNOTATION_FILE, metavar="PATH",
         help=(
-            "JQL generator backend. "
-            "'local' uses a local Ollama model (requires Ollama running). "
-            "'rovo' uses the Atlassian Rovo MCP server (requires ATLASSIAN_OAUTH_TOKEN). "
-            "Overrides JQL_BACKEND env var. (default: local)"
+            "Path to JQL annotation file used to seed the pgvector DB. "
+            f"(default: {DEFAULT_ANNOTATION_FILE})"
         ),
     )
-    backend_group.add_argument(
-        "--examples-file", default=None, metavar="PATH",
-        help=(
-            "Path to a single JQL examples file used as few-shot context for the local LLM. "
-            "Supported formats: .md (markdown with ```jql blocks), "
-            ".json ([{description, jql}]), .csv (description, jql columns). "
-            "Overrides JQL_EXAMPLES_FILE env var. "
-            "(default: data/apache_jira_500_jql_queries.md)"
-        ),
+    parser.add_argument(
+        "--reload-db", action="store_true",
+        help="Force reload of the pgvector DB from the annotation file.",
     )
-    backend_group.add_argument(
-        "--examples-folder", default=None, metavar="PATH",
-        help=(
-            "Path to a folder containing JQL examples files (.md, .json, .csv). "
-            "All supported files in the folder are loaded and merged. "
-            "Takes precedence over --examples-file when both are given. "
-            "Overrides JQL_EXAMPLES_FOLDER env var. "
-            "(default: data/)"
-        ),
-    )
-
     return parser.parse_args()
 
 
@@ -184,41 +221,37 @@ def main():
         print_profiles()
         return
 
-    # Load profile and backend
-    profile   = get_profile(args.profile)
-    generator = get_generator(
-        args.backend,
-        examples_file   = args.examples_file,
-        examples_folder = args.examples_folder,
-    )
+    profile = get_profile(args.profile)
+    logger.info("Profile : %s - %s", profile.name, profile.jira_base_url)
 
-    logger.info("Profile : %s - %s (%s)", profile.name, profile.jira_base_url, profile.email)
-    logger.info("Backend : %s", type(generator).__name__)
+    # ── 1. Load annotation embeddings into pgvector ──────────────────
+    logger.info("Loading JQL annotations into pgvector from: %s", args.annotation_file)
+    model = load_annotations_into_db(args.annotation_file)
 
-    # Health check for the selected backend only
-    ok = asyncio.run(generator.health_check())
-    if not ok:
-        logger.error("Backend is not available. Exiting.")
-        sys.exit(1)
-
-    # Generate JQL from natural language
-    logger.info("Query         : %s", args.query)
-    jql = asyncio.run(generator.generate(args.query, profile=profile))
+    # ── 2. Generate JQL via similarity search + Ollama ───────────────
+    logger.info("Query   : %s", args.query)
+    jql = asyncio.run(generate_jql(args.query, model))
+    jql, jql_limit = _sanitize_jql(jql)
     logger.info("Generated JQL : %s", jql)
 
-    # Run JQL against Jira
-    limit        = _parse_limit(args.query)
+    # ── 3. Run JQL against Jira ──────────────────────────────────────
+    # jql_limit (from LLM LIMIT clause) takes precedence over NL query limit
+    limit        = jql_limit or _parse_limit(args.query)
     fields       = _detect_fields(args.query)
     post_filters = _detect_post_filters(args.query)
 
-    # Ensure post-filter fields appear in the display
     for pf in post_filters:
         if pf.field not in fields and pf.field in FIELD_META:
             fields.insert(0, pf.field)
     fields = fields[:9]
 
-    asyncio.run(atlasmind(profile, jql_query=jql, max_results=limit,
-                          fields=fields, post_filters=post_filters))
+    asyncio.run(atlasmind(
+        profile,
+        jql_query=jql,
+        max_results=limit,
+        fields=fields,
+        post_filters=post_filters,
+    ))
 
 
 if __name__ == "__main__":

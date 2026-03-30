@@ -158,7 +158,7 @@ FIELD_ALIASES: dict[str, str] = {
 # Jira to compensate for records filtered out in Python.  Raise if filters are
 # highly selective (e.g. "took more than 90 days").
 
-POST_FILTER_FETCH_MULTIPLIER: int = 5
+POST_FILTER_FETCH_MULTIPLIER: int = 20
 
 POST_FILTER_PATTERNS: list[tuple] = [
     # "took more than N days/weeks/months to fix/close/resolve"

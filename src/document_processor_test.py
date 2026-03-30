@@ -1,6 +1,8 @@
 import logging
 import os
+import sys
 import psycopg2
+from pathlib import Path
 from urllib.parse import urlparse
 from os import PathLike
 from document_processor import DocumentProcessor
@@ -8,22 +10,20 @@ from dconfig import EmbeddingsConfig
 from pgvector_client import PGVectorClient, PGVectorConfig
 from sentence_transformers import SentenceTransformer
 
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from settings import DATABASE_URL, EMBEDDING_MODEL, EMBEDDING_BATCH_SIZE
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-model_1 = "BAAI/bge-small-en-v1.5"
-
-page_chunks = 50
+model_1 = EMBEDDING_MODEL
 
 ######################################
 # get_pgConfig_env
 #
 ######################################
 def get_pgConfig_env()-> PGVectorConfig:
-    url = urlparse(os.getenv(
-        "DATABASE_URL",
-        "postgresql://postgres:postgres@localhost:5432/jql_vectordb"
-    ))
+    url = urlparse(DATABASE_URL)
     pgConfig = PGVectorConfig(
         database=url.path.lstrip("/"),   # jql_vectordb
         user=url.username,               # postgres
@@ -154,7 +154,7 @@ def update_pgvector_from_annotations(
     processor = DocumentProcessor(embedconfig=embedconfig)
 
     comments = [p["comment"] for p in pairs]
-    embeddings = processor._model.encode(comments, batch_size=32, show_progress_bar=True, normalize_embeddings=True)
+    embeddings = processor._model.encode(comments, batch_size=EMBEDDING_BATCH_SIZE, show_progress_bar=True, normalize_embeddings=True)
 
     logging.info("Encoding complete (%d vectors). Updating pgvector ...", len(embeddings))
     pgVector_db_update(model=processor._model, content_extract_list=pairs, embeddings_list=embeddings)

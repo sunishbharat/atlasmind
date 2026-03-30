@@ -13,24 +13,20 @@ from requests_oauthlib import OAuth2Session
 
 from config import Profile, get_profile
 from config_fields import FIELD_META, DEFAULT_DISPLAY_FIELDS, COMPUTED_FIELD_DEPS, POST_FILTER_FETCH_MULTIPLIER
+from settings import (
+    ROVO_MCP_URL,
+    OAUTH_REDIRECT_URI as REDIRECT_URI,
+    OAUTH_SCOPES       as SCOPES,
+    OAUTH_AUTH_URL     as AUTH_URL,
+    OAUTH_TOKEN_URL    as TOKEN_URL,
+    OAUTH_ENV_FILE     as ENV_FILE,
+    DEFAULT_JQL,
+    MAX_RESULTS,
+)
 
 load_dotenv()
 
 logger = logging.getLogger(__name__)
-
-# ── MCP config ──────────────────────────────────────────────────────
-ROVO_MCP_URL = "https://mcp.atlassian.com/v1/mcp"
-
-# ── OAuth config ────────────────────────────────────────────────────
-REDIRECT_URI = "http://localhost:3334/oauth/callback"
-SCOPES       = ["search:rovo:mcp", "read:me", "read:account", "offline_access"]
-AUTH_URL     = "https://auth.atlassian.com/authorize"
-TOKEN_URL    = "https://auth.atlassian.com/oauth/token"
-ENV_FILE     = ".env"
-
-# ── Default JQL ─────────────────────────────────────────────────────
-DEFAULT_JQL  = "statusCategory != Done ORDER BY created DESC"
-MAX_RESULTS  = 10
 
 
 # ── OAuth 2.1 ───────────────────────────────────────────────────────
@@ -161,6 +157,23 @@ def _apply_post_filters(issues: list, filters: list, limit: int) -> tuple[list, 
     return passing[:limit], len(issues)
 
 
+async def validate_jql(client: httpx.AsyncClient, profile: Profile, jql: str) -> str | None:
+    """Validate JQL against Jira's parse endpoint.
+
+    Returns the first error message if invalid, None if the JQL is valid.
+    Validation is skipped (returns None) if the parse endpoint itself fails.
+    """
+    response = await client.post(
+        f"{profile.jira_base_url}/rest/api/2/jql/parse",
+        json={"queries": [jql]},
+    )
+    if not response.is_success:
+        logger.warning("JQL validation endpoint unavailable (HTTP %d) — skipping", response.status_code)
+        return None
+    errors = response.json().get("queries", [{}])[0].get("errors", [])
+    return errors[0] if errors else None
+
+
 async def atlasmind(
     profile:      Profile,
     jql_query:    str        = DEFAULT_JQL,
@@ -188,6 +201,12 @@ async def atlasmind(
     headers = {"Accept": "application/json", "Content-Type": "application/json"}
 
     async with httpx.AsyncClient(auth=auth, headers=headers) as client:
+        error = await validate_jql(client, profile, jql_query)
+        if error:
+            logger.error("Invalid JQL: %s", error)
+            logger.error("JQL was: %s", jql_query)
+            return
+
         if profile.is_cloud:
             response = await client.post(
                 f"{profile.jira_base_url}/rest/api/3/search/jql",
@@ -220,31 +239,28 @@ async def atlasmind(
     cols.append(("Summary", 0, lambda issue: issue["fields"].get("summary", "")))
 
     # ── Header ──────────────────────────────────────────────────────
-    logger.info("Profile : %s  (%s)", profile.name, profile.jira_base_url)
-    logger.info("JQL     : %s", jql_query)
-    if post_filters:
-        descs = [f"{pf.field} {pf.operator} {pf.threshold}" for pf in post_filters]
-        logger.info("Filter  : %s  (applied in Python after fetch)", " AND ".join(descs))
-    logger.info("Found %d issue(s) in Jira, showing %d (examined %d):", total, len(issues), examined)
-
     header = "".join(label.ljust(width) for label, width, _ in cols[:-1]) + cols[-1][0]
     total_width = max(80, len(header) + 10)
-    logger.info(header)
-    logger.info("-" * total_width)
+
+    print(f"\nProfile : {profile.name}  ({profile.jira_base_url})")
+    print(f"JQL     : {jql_query}")
+    if post_filters:
+        descs = [f"{pf.field} {pf.operator} {pf.threshold}" for pf in post_filters]
+        print(f"Filter  : {' AND '.join(descs)}  (applied in Python after fetch)")
+    print(f"Found {total} issue(s) in Jira, showing {len(issues)} (examined {examined}):\n")
+    print(header)
+    print("-" * total_width)
 
     for issue in issues:
         row = "".join(str(fn(issue))[:width].ljust(width) for _, width, fn in cols[:-1])
         row += str(cols[-1][2](issue))
-        logger.info(row)
+        print(row)
 
-    logger.info("-" * total_width)
+    print("-" * total_width)
     if post_filters:
-        logger.info(
-            "Retrieved %d matching issue(s) (examined %d of %d total; post-filter applied).",
-            len(issues), examined, total,
-        )
+        print(f"Retrieved {len(issues)} matching issue(s) (examined {examined} of {total} total; post-filter applied).")
     else:
-        logger.info("Retrieved %d of %d total issue(s).", len(issues), total)
+        print(f"Retrieved {len(issues)} of {total} total issue(s).")
 
 
 if __name__ == "__main__":
