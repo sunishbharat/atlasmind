@@ -195,6 +195,53 @@ _FIELD_META     = FIELD_META
 _DEFAULT_FIELDS = DEFAULT_DISPLAY_FIELDS
 
 
+def _projects_from_jql(jql: str) -> list[str]:
+    """Return project keys from a 'project IN (A, B, ...)' or 'project = A' clause."""
+    import re
+    m = re.search(r'\bproject\s+IN\s*\(([^)]+)\)', jql, re.IGNORECASE)
+    if m:
+        return [p.strip().strip('"\'') for p in m.group(1).split(',')]
+    m = re.search(r'\bproject\s*=\s*([^\s,)]+)', jql, re.IGNORECASE)
+    if m:
+        return [m.group(1).strip().strip('"\'')]
+    return []
+
+
+def _round_robin(issues: list, projects: list, limit: int) -> list:
+    """Pick issues round-robin across projects so each project is represented."""
+    buckets: dict[str, list] = {p.upper(): [] for p in projects}
+    rest: list = []
+    for issue in issues:
+        proj = issue.get("fields", {}).get("project", {}).get("key", "").upper()
+        if proj in buckets:
+            buckets[proj].append(issue)
+        else:
+            rest.append(issue)
+
+    result: list = []
+    iters = [iter(v) for v in buckets.values() if v]
+    while len(result) < limit and iters:
+        exhausted = []
+        for it in iters:
+            item = next(it, None)
+            if item is None:
+                exhausted.append(it)
+            else:
+                result.append(item)
+                if len(result) >= limit:
+                    break
+        for ex in exhausted:
+            iters.remove(ex)
+
+    # Fill remaining slots from issues that didn't match any known project
+    for issue in rest:
+        if len(result) >= limit:
+            break
+        result.append(issue)
+
+    return result[:limit]
+
+
 def _apply_post_filters(issues: list, filters: list, limit: int) -> tuple[list, int]:
     """Apply Python-side post-filters to a list of Jira issues.
 
@@ -266,18 +313,75 @@ async def validate_jql(client: httpx.AsyncClient, profile: Profile, jql: str) ->
     return errors[0] if errors else None
 
 
+import re as _re
+
+def _replace_project_clause(jql: str, project: str) -> str:
+    """Replace 'project IN (...)' or 'project = X' with 'project = <project>'."""
+    jql = _re.sub(r'\bproject\s+IN\s*\([^)]+\)', f'project = {project}', jql, flags=_re.IGNORECASE)
+    jql = _re.sub(r'\bproject\s*=\s*\S+', f'project = {project}', jql, flags=_re.IGNORECASE)
+    return jql
+
+
+async def atlasmind_multi_project(
+    profile,
+    jql_query:        str,
+    per_project_limits: dict,
+    fields:           list | None = None,
+    post_filters:     list        = None,
+) -> dict | None:
+    """Run one atlasmind() query per project and merge results.
+
+    Used when the user requests different counts per project
+    (e.g. '2 from HIVE and 4 from HADOOP').
+    """
+    combined_issues = []
+    total = 0
+    examined = 0
+
+    for project, limit in per_project_limits.items():
+        project_jql = _replace_project_clause(jql_query, project)
+        result = await atlasmind(
+            profile,
+            jql_query=project_jql,
+            max_results=limit,
+            fields=fields,
+            post_filters=post_filters,
+        )
+        if result:
+            combined_issues.extend(result["issues"])
+            total    += result["total"]
+            examined += result["examined"]
+            display_fields = result["display_fields"]  # same for all sub-queries
+
+    if not combined_issues:
+        return None
+
+    pf_descs = [f"{pf.field} {pf.operator} {pf.threshold}" for pf in (post_filters or [])]
+    return {
+        "profile":        profile.name,
+        "jira_base_url":  profile.jira_base_url,
+        "jql":            jql_query,
+        "total":          total,
+        "shown":          len(combined_issues),
+        "examined":       examined,
+        "post_filters":   pf_descs,
+        "display_fields": display_fields,
+        "issues":         combined_issues,
+    }
+
+
 async def atlasmind(
     profile:      Profile,
     jql_query:    str        = DEFAULT_JQL,
     max_results:  int        = MAX_RESULTS,
     fields:       list[str] | None = None,
     post_filters: list       = None,
-):
-    """Execute a JQL query against Jira and print results as a formatted table.
+) -> dict | None:
+    """Execute a JQL query against Jira and return structured results.
 
     Validates the JQL, executes the search via the Jira REST API (v3 for Cloud,
-    v2 for Server/Data Center), applies any Python-side post-filters, and prints
-    a column-aligned results table to stdout.
+    v2 for Server/Data Center), applies any Python-side post-filters, and returns
+    a result dict suitable for JSON serialisation or table rendering.
 
     Args:
         profile: The active Profile with Jira URL and credentials.
@@ -287,6 +391,11 @@ async def atlasmind(
                 Defaults to DEFAULT_DISPLAY_FIELDS when None.
         post_filters: List of PostFilter namedtuples for Python-side filtering
                       (e.g. days_to_fix > 20). Applied after the API fetch.
+
+    Returns:
+        dict with keys: profile, jira_base_url, jql, total, shown, examined,
+        post_filters (list of str descriptions), issues (list of field dicts).
+        Returns None on JQL validation failure or HTTP error.
     """
     # Build the ordered field list: dynamic fields (excluding summary) + summary last
     display_fields = fields if fields is not None else _DEFAULT_FIELDS
@@ -298,11 +407,13 @@ async def atlasmind(
         for dep in COMPUTED_FIELD_DEPS.get(field, []):
             if dep not in display_fields and dep not in extra_api:
                 extra_api.append(dep)
-    computed  = set(COMPUTED_FIELD_DEPS.keys())
-    api_fields = [f for f in display_fields if f not in computed] + extra_api + ["summary"]
+    computed   = set(COMPUTED_FIELD_DEPS.keys())
+    api_fields = [f for f in display_fields if f not in computed] + extra_api + ["summary", "project"]
 
     post_filters = post_filters or []
-    fetch_limit  = max_results * POST_FILTER_FETCH_MULTIPLIER if post_filters else max_results
+    projects     = _projects_from_jql(jql_query)
+    project_mult = max(1, len(projects))
+    fetch_limit  = max_results * (POST_FILTER_FETCH_MULTIPLIER if post_filters else project_mult)
 
     auth    = (profile.email, profile.token) if profile.email and profile.token else None
     headers = {"Accept": "application/json", "Content-Type": "application/json"}
@@ -312,7 +423,7 @@ async def atlasmind(
         if error:
             logger.error("Invalid JQL: %s", error)
             logger.error("JQL was: %s", jql_query)
-            return
+            return None
 
         if profile.is_cloud:
             response = await client.post(
@@ -327,47 +438,42 @@ async def atlasmind(
 
         if not response.is_success:
             logger.error("HTTP %d: %s", response.status_code, response.text[:200])
-        response.raise_for_status()
+            return None
         data = response.json()
 
     issues = data.get("issues", [])
     total  = data.get("total", 0)
 
+    if len(projects) > 1:
+        issues = _round_robin(issues, projects, max_results)
+
     examined = len(issues)
     if post_filters:
         issues, examined = _apply_post_filters(issues, post_filters, max_results)
 
-    # ── Build column specs ──────────────────────────────────────────
-    cols = [("Key", 12, lambda issue: issue["key"])]
-    for field_name in display_fields:
-        label, width, extractor = _FIELD_META[field_name]
-        cols.append((label, width, lambda issue, ex=extractor: ex(issue["fields"])))
-    # Summary always last, fills remaining width
-    cols.append(("Summary", 0, lambda issue: issue["fields"].get("summary", "")))
-
-    # ── Header ──────────────────────────────────────────────────────
-    header = "".join(label.ljust(width) for label, width, _ in cols[:-1]) + cols[-1][0]
-    total_width = max(80, len(header) + 10)
-
-    print(f"\nProfile : {profile.name}  ({profile.jira_base_url})")
-    print(f"JQL     : {jql_query}")
-    if post_filters:
-        descs = [f"{pf.field} {pf.operator} {pf.threshold}" for pf in post_filters]
-        print(f"Filter  : {' AND '.join(descs)}  (applied in Python after fetch)")
-    print(f"Found {total} issue(s) in Jira, showing {len(issues)} (examined {examined}):\n")
-    print(header)
-    print("-" * total_width)
-
+    # ── Extract display values using FIELD_META extractors ──────────
+    result_issues = []
     for issue in issues:
-        row = "".join(str(fn(issue))[:width].ljust(width) for _, width, fn in cols[:-1])
-        row += str(cols[-1][2](issue))
-        print(row)
+        row: dict = {"key": issue["key"]}
+        for field_name in display_fields:
+            _, _, extractor = _FIELD_META[field_name]
+            row[field_name] = extractor(issue["fields"])
+        row["summary"] = issue["fields"].get("summary", "")
+        result_issues.append(row)
 
-    print("-" * total_width)
-    if post_filters:
-        print(f"Retrieved {len(issues)} matching issue(s) (examined {examined} of {total} total; post-filter applied).")
-    else:
-        print(f"Retrieved {len(issues)} of {total} total issue(s).")
+    pf_descs = [f"{pf.field} {pf.operator} {pf.threshold}" for pf in post_filters]
+
+    return {
+        "profile":       profile.name,
+        "jira_base_url": profile.jira_base_url,
+        "jql":           jql_query,
+        "total":         total,
+        "shown":         len(result_issues),
+        "examined":      examined,
+        "post_filters":  pf_descs,
+        "display_fields": display_fields,
+        "issues":        result_issues,
+    }
 
 
 if __name__ == "__main__":

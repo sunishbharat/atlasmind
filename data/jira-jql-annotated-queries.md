@@ -1295,3 +1295,27 @@ project = ZOOKEEPER AND issueFunction NOT IN hasSubtasks() ORDER BY created DESC
 
 /* 410. Show up to 10 issues linked to unresolved bugs in ZOOKEEPER */
 project = ZOOKEEPER AND issueFunction IN linkedIssuesOf("issuetype = Bug AND resolution = Unresolved", "", "is blocked by") ORDER BY updated DESC
+
+/* 411. Open issues assigned to me, highest priority first */
+assignee = currentUser() AND resolution IS EMPTY ORDER BY priority DESC, updated DESC
+
+/* 412. All bugs in project KAFKA created in the last 30 days */
+project = KAFKA AND issuetype = Bug AND created >= -30d ORDER BY created DESC
+
+/* 413. Stories in ZOOKEEPER that are In Progress or In Review */
+project = ZOOKEEPER AND issuetype = Story AND status IN ("In Progress", "In Review") ORDER BY updated DESC
+
+/* 414. Major or Critical issues resolved this month */
+priority IN (Major, Critical) AND resolutiondate >= startOfMonth() AND resolutiondate <= endOfMonth() ORDER BY resolutiondate DESC
+
+/* 415. Issues without an assignee that are not Done */
+assignee IS EMPTY AND statusCategory != Done ORDER BY created ASC
+
+/* 416. List all supported issue types in project KAFKA (distinct in results view) */
+project = KAFKA ORDER BY issuetype ASC
+
+/* 417. Combined issues from ZOOKEEPER and HIVE, newest first */
+project IN (ZOOKEEPER, HIVE) ORDER BY created DESC
+
+/* 418. Open issues from ZOOKEEPER and HIVE, sorted by project then key */
+project IN (ZOOKEEPER, HIVE) AND resolution IS EMPTY ORDER BY project, key

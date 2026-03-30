@@ -25,7 +25,7 @@ from typing import NamedTuple
 import httpx
 from sentence_transformers import SentenceTransformer
 
-from atlasmind import atlasmind, MAX_RESULTS
+from atlasmind import atlasmind, atlasmind_multi_project, MAX_RESULTS
 from config import get_profile, print_profiles
 from config_fields import (
     DEFAULT_DISPLAY_FIELDS, FIELD_META, QUERY_FIELD_MAP,
@@ -199,6 +199,23 @@ def _sanitize_jql(jql: str) -> tuple[str, int | None]:
 
 # ── Query helpers ────────────────────────────────────────────────────
 
+def _fields_from_order_by(jql: str) -> list[str]:
+    """Return FIELD_META keys found in the ORDER BY clause of the given JQL."""
+    m = re.search(r"\bORDER\s+BY\b(.+?)(?=\bLIMIT\b|$)", jql, flags=re.IGNORECASE | re.DOTALL)
+    if not m:
+        return []
+    result = []
+    for token in re.split(r"[,\s]+", m.group(1).strip()):
+        token = token.strip()
+        if token.upper() in ("ASC", "DESC", ""):
+            continue
+        for key in FIELD_META:
+            if key.lower() == token.lower():
+                result.append(key)
+                break
+    return result
+
+
 def _detect_fields(query: str) -> list[str]:
     """Infer Jira display fields from keywords in the natural language query.
 
@@ -228,22 +245,42 @@ def _detect_fields(query: str) -> list[str]:
 def _parse_limit(query: str) -> int:
     """Extract an explicit record count from the natural language query.
 
-    Matches patterns like "show 20 issues" or "top 5 bugs". Deliberately avoids
-    bare number matching to prevent filter values (e.g. "20 days", "last 7 days")
-    from being misinterpreted as record limits.
+    When multiple per-project counts are stated (e.g. "4 issues from HIVE and
+    5 from KAFKA") their values are summed so all requested issues are fetched.
+    Falls back to MAX_RESULTS only when the query contains no explicit count.
 
     Args:
         query: The user's natural language query string.
 
     Returns:
-        int: The extracted record limit, or MAX_RESULTS if no count is found.
+        int: The sum of all explicit counts found, or MAX_RESULTS if none.
     """
-    # Explicit record-count patterns only — avoid grabbing numbers that belong
-    # to filter conditions like "more than 20 days" or "last 7 days".
+    # Per-project counts: "4 issues from HIVE and 5 issues from KAFKA"
+    per_project = re.findall(r'\b(\d+)\s+issues?\s+(?:from\s+)?(?:project\s+)?[A-Z][A-Z0-9_]*', query, re.IGNORECASE)
+    if len(per_project) > 1:
+        return sum(int(n) for n in per_project)
+
+    # Single explicit count: "list 5 issues" / "top 10 bugs"
     m = re.search(r'\b(\d+)\s+issue', query, re.IGNORECASE)
     if not m:
         m = re.search(r'\b(?:top|first|last|show|list|get|fetch)\s+(\d+)\b', query, re.IGNORECASE)
     return int(m.group(1)) if m else MAX_RESULTS
+
+
+def _parse_per_project_limits(query: str) -> dict[str, int]:
+    """Detect per-project counts like '2 issues from HIVE and 4 from HADOOP'.
+
+    Returns {PROJECT: limit} when different counts per project are found,
+    empty dict otherwise (single limit applies to all projects).
+    """
+    matches = re.findall(
+        r'\b(\d+)\s+issues?\s+(?:from\s+)?(?:project\s+)?([A-Z][A-Z0-9_]*)',
+        query,
+        re.IGNORECASE,
+    )
+    if len(matches) < 2:
+        return {}
+    return {proj.upper(): int(n) for n, proj in matches}
 
 
 def _detect_post_filters(query: str) -> list[PostFilter]:
@@ -274,6 +311,51 @@ def _detect_post_filters(query: str) -> list[PostFilter]:
     return filters
 
 
+# ── Output ───────────────────────────────────────────────────────────
+
+def _print_table(result: dict) -> None:
+    """Render the structured result dict returned by atlasmind() as a table."""
+    display_fields = result["display_fields"]
+    issues         = result["issues"]
+
+    # Column specs: (header_label, fixed_width)
+    cols: list[tuple[str, int]] = [("Key", 12)]
+    for field_name in display_fields:
+        label, width, _ = FIELD_META[field_name]
+        cols.append((label, width))
+    cols.append(("Summary", 0))
+
+    header      = "".join(label.ljust(width) for label, width in cols[:-1]) + cols[-1][0]
+    total_width = max(80, len(header) + 10)
+
+    print(f"\nProfile : {result['profile']}  ({result['jira_base_url']})")
+    print(f"JQL     : {result['jql']}")
+    if result["post_filters"]:
+        print(f"Filter  : {' AND '.join(result['post_filters'])}  (applied in Python after fetch)")
+    print(f"Found {result['total']} issue(s) in Jira, showing {result['shown']} (examined {result['examined']}):\n")
+    print(header)
+    print("-" * total_width)
+
+    for issue in issues:
+        row = ""
+        for field_name, (_, width) in zip(
+            ["key"] + display_fields,
+            cols[:-1],
+        ):
+            row += str(issue.get(field_name, ""))[:width].ljust(width)
+        row += str(issue.get("summary", ""))
+        print(row)
+
+    print("-" * total_width)
+    if result["post_filters"]:
+        print(
+            f"Retrieved {result['shown']} matching issue(s) "
+            f"(examined {result['examined']} of {result['total']} total; post-filter applied)."
+        )
+    else:
+        print(f"Retrieved {result['shown']} of {result['total']} total issue(s).")
+
+
 # ── CLI ──────────────────────────────────────────────────────────────
 
 def parse_args():
@@ -287,6 +369,25 @@ def parse_args():
         prog="atlasmind",
         description="AtlasMind — Query Jira using natural language via local Ollama LLM.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+modes:
+  CLI (default)   Run a single query and print results as a table to stdout.
+  --server        Start a FastAPI HTTP server; results are returned as JSON.
+                  Endpoint: GET /query?q=<natural language>&profile=<name>&limit=<n>
+
+examples:
+  # Single query (CLI)
+  uv run python main.py --query "list 5 open bugs in KAFKA"
+  uv run python main.py --query "show issues resolved in ZOOKEEPER last 30 days" --profile work
+
+  # Server mode
+  uv run python main.py --server
+  uv run python main.py --server --host 127.0.0.1 --port 9000
+
+  # Then query the server
+  curl "http://localhost:8000/query?q=list+5+bugs+in+KAFKA"
+  curl "http://localhost:8000/query?q=open+issues+in+HADOOP&limit=20&profile=work"
+""",
     )
     parser.add_argument(
         "--query", default="list all open issues", metavar="TEXT",
@@ -310,6 +411,18 @@ def parse_args():
     parser.add_argument(
         "--reload-db", action="store_true",
         help="Force reload of the pgvector DB from the annotation file.",
+    )
+    parser.add_argument(
+        "--server", action="store_true",
+        help="Start AtlasMind as a FastAPI HTTP server instead of running a single query.",
+    )
+    parser.add_argument(
+        "--host", default="0.0.0.0", metavar="HOST",
+        help="Host to bind the server to (default: 0.0.0.0). Only used with --server.",
+    )
+    parser.add_argument(
+        "--port", type=int, default=8000, metavar="PORT",
+        help="Port to bind the server to (default: 8000). Only used with --server.",
     )
     return parser.parse_args()
 
@@ -337,6 +450,13 @@ def main():
         print_profiles()
         return
 
+    if args.server:
+        import uvicorn
+        from server import app
+        logger.info("Starting AtlasMind server on %s:%d", args.host, args.port)
+        uvicorn.run(app, host=args.host, port=args.port)
+        return
+
     profile = get_profile(args.profile)
     logger.info("Profile : %s - %s", profile.name, profile.jira_base_url)
 
@@ -356,18 +476,35 @@ def main():
     fields       = _detect_fields(args.query)
     post_filters = _detect_post_filters(args.query)
 
+    # Surface any fields the LLM put in ORDER BY that aren't already shown
+    for order_field in _fields_from_order_by(jql):
+        if order_field not in fields and order_field in FIELD_META:
+            fields.append(order_field)
+
     for pf in post_filters:
         if pf.field not in fields and pf.field in FIELD_META:
             fields.insert(0, pf.field)
     fields = fields[:9]
 
-    asyncio.run(atlasmind(
-        profile,
-        jql_query=jql,
-        max_results=limit,
-        fields=fields,
-        post_filters=post_filters,
-    ))
+    per_project = _parse_per_project_limits(args.query)
+    if per_project:
+        result = asyncio.run(atlasmind_multi_project(
+            profile,
+            jql_query=jql,
+            per_project_limits=per_project,
+            fields=fields,
+            post_filters=post_filters,
+        ))
+    else:
+        result = asyncio.run(atlasmind(
+            profile,
+            jql_query=jql,
+            max_results=limit,
+            fields=fields,
+            post_filters=post_filters,
+        ))
+    if result:
+        _print_table(result)
 
 
 if __name__ == "__main__":
