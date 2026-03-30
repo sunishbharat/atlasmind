@@ -23,7 +23,7 @@ EMBEDDING_BATCH_SIZE = 32
 # ── JQL annotation file ───────────────────────────────────────────────
 DEFAULT_ANNOTATION_FILE = os.getenv(
     "JQL_ANNOTATION_FILE",
-    str(_ROOT / "data" / "new_Format_jql_annotated.md"),
+    str(_ROOT / "data" / "jira-jql-annotated-queries.md"),
 )
 
 # ── Jira query defaults ───────────────────────────────────────────────

@@ -28,6 +28,17 @@ PROFILES_FILE = Path(__file__).parent / "profiles.json"
 
 @dataclass
 class Profile:
+    """Atlassian connection profile loaded from profiles.json.
+
+    Attributes:
+        name:          Profile identifier (matches the key in profiles.json).
+        jira_url:      Base URL of the Jira instance (e.g. https://mysite.atlassian.net).
+        email:         Atlassian account email used for Basic Auth.
+        token:         Atlassian API token or personal access token.
+        client_id:     OAuth 2.1 client ID (required for Rovo MCP OAuth flow).
+        client_secret: OAuth 2.1 client secret.
+        jira_type:     "cloud" for Atlassian Cloud or "server" for Server/Data Center.
+    """
     name:          str
     jira_url:      str
     email:         str
@@ -38,10 +49,12 @@ class Profile:
 
     @property
     def jira_base_url(self) -> str:
+        """Jira base URL with trailing slash removed."""
         return self.jira_url.rstrip("/")
 
     @property
     def is_cloud(self) -> bool:
+        """True when jira_type is "cloud"; False for Server/Data Center."""
         return self.jira_type == "cloud"
 
 

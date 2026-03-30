@@ -23,6 +23,17 @@ from datetime import datetime
 # ── Date helpers (used by computed fields below) ─────────────────────
 
 def _parse_jira_dt(value: str | None) -> datetime | None:
+    """Parse an ISO 8601 datetime string from a Jira field value.
+
+    Handles both UTC strings ending in "Z" and timezone-aware strings.
+
+    Args:
+        value: ISO 8601 datetime string from Jira (e.g. "2024-01-15T10:30:00.000+0000"),
+               or None if the field is absent.
+
+    Returns:
+        datetime | None: Timezone-aware datetime object, or None if value is empty/invalid.
+    """
     if not value:
         return None
     try:

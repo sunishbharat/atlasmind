@@ -1,3 +1,16 @@
+"""
+document_processor_test.py — pgvector embedding pipeline for AtlasMind.
+
+Responsible for:
+- Building a PGVectorConfig from the DATABASE_URL environment variable.
+- Encoding annotation comments into vector embeddings via SentenceTransformer.
+- Storing (annotation, jql, embedding) rows in the pgvector `items` table.
+- Performing similarity search against stored embeddings for RAG retrieval.
+
+Called by main.py at startup to seed the vector DB, and again per query
+to retrieve the top-5 most semantically similar JQL examples.
+"""
+
 import logging
 import os
 import sys
@@ -22,7 +35,13 @@ model_1 = EMBEDDING_MODEL
 # get_pgConfig_env
 #
 ######################################
-def get_pgConfig_env()-> PGVectorConfig:
+def get_pgConfig_env() -> PGVectorConfig:
+    """Build a PGVectorConfig by parsing the DATABASE_URL environment variable.
+
+    Returns:
+        PGVectorConfig: Connection parameters (host, port, database, user, password)
+        extracted from the DATABASE_URL connection string.
+    """
     url = urlparse(DATABASE_URL)
     pgConfig = PGVectorConfig(
         database=url.path.lstrip("/"),   # jql_vectordb
@@ -36,7 +55,20 @@ def get_pgConfig_env()-> PGVectorConfig:
 ##########################################
 # Test the embeddings with a user query
 ##########################################
-def test_embeddings(query:str, model:SentenceTransformer) -> list[tuple]:
+def test_embeddings(query: str, model: SentenceTransformer) -> list[tuple]:
+    """Similarity search against the legacy `text` column schema in pgvector.
+
+    Encodes the query and retrieves the top-5 nearest neighbours from the
+    `items` table using the `text` column. This function targets the old
+    single-column schema; use test_embeddings_jql() for the annotation/jql schema.
+
+    Args:
+        query: Natural language query string to encode and search.
+        model: SentenceTransformer model used to encode the query.
+
+    Returns:
+        list[tuple]: List of (id, text, distance) rows from pgvector.
+    """
     query_emb = model.encode(query, normalize_embeddings=True)
     
     sql = """
@@ -64,6 +96,21 @@ def test_embeddings(query:str, model:SentenceTransformer) -> list[tuple]:
 # Test the embeddings for JQL annotations
 ##########################################
 def test_embeddings_jql(query: str, model: SentenceTransformer) -> tuple[list[tuple], SentenceTransformer]:
+    """Similarity search against the annotation/jql schema in pgvector.
+
+    Encodes the query and retrieves the top-5 nearest neighbours from the
+    `items` table, selecting the `annotation` and `jql` columns. Used by
+    generate_jql() in main.py to build the few-shot RAG prompt.
+
+    Args:
+        query: Natural language query string to encode and search.
+        model: SentenceTransformer model used to encode the query.
+
+    Returns:
+        tuple[list[tuple], SentenceTransformer]: A 2-tuple of:
+            - list of (id, annotation, jql, distance) rows from pgvector
+            - the same model passed in (for chaining)
+    """
     query_emb = model.encode(query, normalize_embeddings=True)
 
     sql = """
@@ -106,8 +153,20 @@ def _ensure_extension(pgConfig: PGVectorConfig) -> None:
 # pgVector_db_update
 #
 ######################################
-def pgVector_db_update(model:SentenceTransformer ,content_extract_list:list, embeddings_list):
+def pgVector_db_update(model: SentenceTransformer, content_extract_list: list, embeddings_list):
+    """Drop and recreate the `items` table, then bulk-insert annotation embeddings.
 
+    Drops the existing `items` table (if any), creates a fresh one with the
+    annotation/jql/embedding schema sized to the model's embedding dimension,
+    and inserts one row per (comment, jql, embedding) triplet.
+
+    Args:
+        model: SentenceTransformer model — used only to determine embedding dimension.
+        content_extract_list: List of {"comment": ..., "jql": ...} dicts from
+                              parse_jql_annotations().
+        embeddings_list: Parallel list of numpy embedding vectors, one per dict
+                         in content_extract_list.
+    """
     embd_dim = model.get_sentence_embedding_dimension()
     pgConfig  = get_pgConfig_env()
     _ensure_extension(pgConfig)   # create extension before PGVectorClient registers vector type
@@ -185,7 +244,18 @@ def document_proc_test(path:str|PathLike) -> list[str]:
     return records, model
 
 from jql_annotation_parser import parse_jql_annotations
+
+
 def jql_annotation_test():
+    """End-to-end test: parse the default annotation file and load embeddings into pgvector.
+
+    Parses ``data/new_Format_jql_annotated.md``, encodes the comments with
+    SentenceTransformer, stores the results in pgvector, and returns the model
+    for immediate use in similarity search.
+
+    Returns:
+        SentenceTransformer: The embedding model used (same instance as stored in pgvector).
+    """
     logging.info("jql_annotation_test started")
     pairs = parse_jql_annotations(path=r"./data/new_Format_jql_annotated.md")
     model = update_pgvector_from_annotations(pairs=pairs)

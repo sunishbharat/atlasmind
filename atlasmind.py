@@ -1,3 +1,16 @@
+"""
+atlasmind.py — Jira REST API client and result renderer for AtlasMind.
+
+Responsibilities:
+- OAuth 2.1 token acquisition and Rovo MCP connectivity check.
+- JQL validation via the Jira /jql/parse endpoint.
+- Jira issue search using REST API v3 (Cloud) or v2 (Server/Data Center).
+- Python-side post-filtering for constraints that JQL cannot express.
+- Column-aligned table output to stdout.
+
+Configuration is read from settings.py; field metadata from config_fields.py.
+"""
+
 import asyncio
 import base64
 import logging
@@ -32,6 +45,14 @@ logger = logging.getLogger(__name__)
 # ── OAuth 2.1 ───────────────────────────────────────────────────────
 
 def _wait_for_callback() -> str:
+    """Start a one-shot local HTTP server and wait for the OAuth redirect callback.
+
+    Listens on localhost:3334 for a single GET request (the OAuth redirect),
+    captures the full callback URL including the authorization code, and returns it.
+
+    Returns:
+        str: The full callback URL with OAuth authorization code query parameters.
+    """
     callback_url = {}
 
     class Handler(BaseHTTPRequestHandler):
@@ -49,6 +70,20 @@ def _wait_for_callback() -> str:
 
 
 def get_oauth_token(profile: Profile) -> str:
+    """Obtain an Atlassian OAuth 2.1 access token for the given profile.
+
+    Checks the ATLASSIAN_OAUTH_TOKEN env var first; if not set, runs the full
+    browser-based authorization flow, caches the token in .env, and returns it.
+
+    Args:
+        profile: The active Profile containing client_id and client_secret.
+
+    Returns:
+        str: A valid OAuth 2.1 bearer token.
+
+    Raises:
+        RuntimeError: If client_id or client_secret are missing from the profile.
+    """
     cached = os.getenv("ATLASSIAN_OAUTH_TOKEN")
     if cached:
         return cached
@@ -80,6 +115,14 @@ def get_oauth_token(profile: Profile) -> str:
 # ── MCP transports ──────────────────────────────────────────────────
 
 def _transport_bearer(token: str) -> StreamableHttpTransport:
+    """Build a StreamableHttpTransport authenticated with a Bearer token.
+
+    Args:
+        token: OAuth 2.1 bearer access token.
+
+    Returns:
+        StreamableHttpTransport configured for the Rovo MCP endpoint.
+    """
     return StreamableHttpTransport(
         url=ROVO_MCP_URL,
         headers={"Authorization": f"Bearer {token}"},
@@ -87,6 +130,14 @@ def _transport_bearer(token: str) -> StreamableHttpTransport:
 
 
 def _transport_basic(profile: Profile) -> StreamableHttpTransport:
+    """Build a StreamableHttpTransport authenticated with Basic Auth.
+
+    Args:
+        profile: Profile containing email and API token credentials.
+
+    Returns:
+        StreamableHttpTransport configured for the Rovo MCP endpoint.
+    """
     credentials = base64.b64encode(
         f"{profile.email}:{profile.token}".encode()
     ).decode()
@@ -99,6 +150,15 @@ def _transport_basic(profile: Profile) -> StreamableHttpTransport:
 # ── MCP health check ────────────────────────────────────────────────
 
 async def check_rovo_mcp(profile: Profile, bearer_token: str | None = None):
+    """Check connectivity to the Atlassian Rovo MCP server and list available tools.
+
+    Uses OAuth 2.1 Bearer auth if bearer_token is provided, otherwise falls back
+    to Basic Auth using the profile credentials.
+
+    Args:
+        profile: The active Profile (used for Basic Auth and display name).
+        bearer_token: Optional OAuth 2.1 access token. If None, Basic Auth is used.
+    """
     transport   = _transport_bearer(bearer_token) if bearer_token else _transport_basic(profile)
     auth_method = "OAuth 2.1" if bearer_token else "Basic Auth"
 
@@ -116,6 +176,14 @@ async def check_rovo_mcp(profile: Profile, bearer_token: str | None = None):
 # ── Jira REST API ───────────────────────────────────────────────────
 
 async def get_cloud_id(profile: Profile) -> str:
+    """Retrieve the Atlassian Cloud ID for the Jira instance in the given profile.
+
+    Args:
+        profile: The active Profile containing jira_base_url and credentials.
+
+    Returns:
+        str: The cloudId string for the Atlassian tenant.
+    """
     async with httpx.AsyncClient(auth=(profile.email, profile.token)) as client:
         r = await client.get(f"{profile.jira_base_url}/_edge/tenant_info")
         r.raise_for_status()
@@ -128,7 +196,20 @@ _DEFAULT_FIELDS = DEFAULT_DISPLAY_FIELDS
 
 
 def _apply_post_filters(issues: list, filters: list, limit: int) -> tuple[list, int]:
-    """Apply post-filters to issues, return (passing_issues, examined_count)."""
+    """Apply Python-side post-filters to a list of Jira issues.
+
+    Used for constraints that JQL cannot express (e.g. computed fields like
+    days_to_fix). Iterates issues, evaluates each filter condition, and collects
+    passing issues up to the requested limit.
+
+    Args:
+        issues: List of raw Jira issue dicts from the REST API response.
+        filters: List of PostFilter namedtuples (field, operator, threshold).
+        limit: Maximum number of passing issues to return.
+
+    Returns:
+        tuple[list, int]: (passing_issues, total_examined_count)
+    """
     _OPS = {
         ">"  : lambda a, b: a >  b,
         ">=" : lambda a, b: a >= b,
@@ -158,10 +239,21 @@ def _apply_post_filters(issues: list, filters: list, limit: int) -> tuple[list, 
 
 
 async def validate_jql(client: httpx.AsyncClient, profile: Profile, jql: str) -> str | None:
-    """Validate JQL against Jira's parse endpoint.
+    """Validate a JQL string against Jira's /jql/parse endpoint.
 
-    Returns the first error message if invalid, None if the JQL is valid.
-    Validation is skipped (returns None) if the parse endpoint itself fails.
+    Sends the JQL to the Jira parse API before executing the search, allowing
+    invalid queries to be caught and logged cleanly instead of raising HTTP 400.
+    Validation is silently skipped if the endpoint is unavailable (e.g. older
+    Jira Server versions that do not expose /jql/parse).
+
+    Args:
+        client: An active httpx.AsyncClient with Jira credentials configured.
+        profile: The active Profile providing the Jira base URL.
+        jql: The JQL string to validate.
+
+    Returns:
+        str | None: The first JQL error message if invalid, None if valid or
+        if the parse endpoint is unavailable.
     """
     response = await client.post(
         f"{profile.jira_base_url}/rest/api/2/jql/parse",
@@ -181,6 +273,21 @@ async def atlasmind(
     fields:       list[str] | None = None,
     post_filters: list       = None,
 ):
+    """Execute a JQL query against Jira and print results as a formatted table.
+
+    Validates the JQL, executes the search via the Jira REST API (v3 for Cloud,
+    v2 for Server/Data Center), applies any Python-side post-filters, and prints
+    a column-aligned results table to stdout.
+
+    Args:
+        profile: The active Profile with Jira URL and credentials.
+        jql_query: JQL string to execute. Defaults to DEFAULT_JQL from settings.
+        max_results: Maximum number of issues to display. Defaults to MAX_RESULTS.
+        fields: List of field names (from FIELD_META) to include as columns.
+                Defaults to DEFAULT_DISPLAY_FIELDS when None.
+        post_filters: List of PostFilter namedtuples for Python-side filtering
+                      (e.g. days_to_fix > 20). Applied after the API fetch.
+    """
     # Build the ordered field list: dynamic fields (excluding summary) + summary last
     display_fields = fields if fields is not None else _DEFAULT_FIELDS
     # Ensure only known fields, cap at 9 extra (+ summary = 10 total)
