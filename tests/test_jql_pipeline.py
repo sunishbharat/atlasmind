@@ -13,10 +13,12 @@ from pathlib import Path
 # Allow importing from the project root without installing the package
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from main import _remove_field_arithmetic, _sanitize_jql, _detect_post_filters, _parse_limit
+from unittest.mock import AsyncMock, MagicMock, patch
+
+from main import _remove_field_arithmetic, _sanitize_jql, _detect_post_filters, _parse_limit, _JQL_TAG, generate_jql
 
 
-# ── 1. Field arithmetic removal ───────────────────────────────────────
+# -- 1. Field arithmetic removal ---------------------------------------
 
 class TestRemoveFieldArithmetic:
     """LLM commonly generates two forms of invalid date arithmetic; both must be stripped."""
@@ -51,7 +53,7 @@ class TestRemoveFieldArithmetic:
         assert _remove_field_arithmetic(jql) == jql
 
 
-# ── 2. LIMIT clause extraction ────────────────────────────────────────
+# -- 2. LIMIT clause extraction ----------------------------------------
 
 class TestSanitizeJql:
     """LIMIT is a reserved SQL keyword that Jira rejects; it must be stripped and returned."""
@@ -80,7 +82,7 @@ class TestSanitizeJql:
         assert "project = FOO" in clean
 
 
-# ── 3. Post-filter detection and limit parsing ────────────────────────
+# -- 3. Post-filter detection and limit parsing ------------------------
 
 class TestPostFilterAndLimit:
     """Filter-condition numbers (e.g. '20 days') must not bleed into record limits."""
@@ -121,3 +123,50 @@ class TestPostFilterAndLimit:
         """Queries without time-duration phrases must produce no post-filters."""
         query = "show all open bugs in project KAFKA"
         assert _detect_post_filters(query) == []
+
+
+# -- 4. Non-JQL (general) query routing --------------------------------
+
+import asyncio
+
+class TestNonJqlRouting:
+    """When Ollama responds without the <<JQL>> prefix, generate_jql must
+    return is_general=True and the caller must skip the Jira REST API."""
+
+    def _make_client_mock(self, ollama_answer: str):
+        """Build a mocked httpx.AsyncClient that returns ollama_answer from POST."""
+        mock_response = MagicMock()
+        mock_response.json.return_value = {"response": ollama_answer}
+        mock_response.raise_for_status = MagicMock()
+
+        mock_client = AsyncMock()
+        mock_client.__aenter__.return_value = mock_client
+        mock_client.__aexit__.return_value = False
+        mock_client.post = AsyncMock(return_value=mock_response)
+        return mock_client
+
+    def test_general_query_returns_is_general_true(self):
+        """A greeting response from Ollama (no <<JQL>> prefix) must set is_general=True."""
+        ollama_answer = "Hello! I am doing well, thank you for asking."
+        mock_examples = [(1, "some annotation", "project = FOO", 0.5)]
+
+        with patch("main.test_embeddings_jql", return_value=(mock_examples, None)), \
+             patch("httpx.AsyncClient", return_value=self._make_client_mock(ollama_answer)):
+            text, is_general = asyncio.run(generate_jql("How are you?", model=MagicMock()))
+
+        assert is_general is True
+        assert _JQL_TAG not in text
+        assert text == ollama_answer
+
+    def test_jql_query_returns_is_general_false(self):
+        """A JQL response from Ollama (with <<JQL>> prefix) must set is_general=False and strip the tag."""
+        jql = "project = HADOOP AND status = Open ORDER BY created DESC"
+        ollama_answer = f"{_JQL_TAG}{jql}"
+        mock_examples = [(1, "some annotation", jql, 0.3)]
+
+        with patch("main.test_embeddings_jql", return_value=(mock_examples, None)), \
+             patch("httpx.AsyncClient", return_value=self._make_client_mock(ollama_answer)):
+            text, is_general = asyncio.run(generate_jql("list open issues in HADOOP", model=MagicMock()))
+
+        assert is_general is False
+        assert text == jql

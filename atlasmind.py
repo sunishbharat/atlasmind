@@ -42,7 +42,7 @@ load_dotenv()
 logger = logging.getLogger(__name__)
 
 
-# ── OAuth 2.1 ───────────────────────────────────────────────────────
+# -- OAuth 2.1 -------------------------------------------------------
 
 def _wait_for_callback() -> str:
     """Start a one-shot local HTTP server and wait for the OAuth redirect callback.
@@ -112,7 +112,7 @@ def get_oauth_token(profile: Profile) -> str:
     return access_token
 
 
-# ── MCP transports ──────────────────────────────────────────────────
+# -- MCP transports --------------------------------------------------
 
 def _transport_bearer(token: str) -> StreamableHttpTransport:
     """Build a StreamableHttpTransport authenticated with a Bearer token.
@@ -147,7 +147,7 @@ def _transport_basic(profile: Profile) -> StreamableHttpTransport:
     )
 
 
-# ── MCP health check ────────────────────────────────────────────────
+# -- MCP health check ------------------------------------------------
 
 async def check_rovo_mcp(profile: Profile, bearer_token: str | None = None):
     """Check connectivity to the Atlassian Rovo MCP server and list available tools.
@@ -173,7 +173,7 @@ async def check_rovo_mcp(profile: Profile, bearer_token: str | None = None):
         logger.warning("Server is UNREACHABLE: %s", e)
 
 
-# ── Jira REST API ───────────────────────────────────────────────────
+# -- Jira REST API ---------------------------------------------------
 
 async def get_cloud_id(profile: Profile) -> str:
     """Retrieve the Atlassian Cloud ID for the Jira instance in the given profile.
@@ -285,33 +285,6 @@ def _apply_post_filters(issues: list, filters: list, limit: int) -> tuple[list, 
     return passing[:limit], len(issues)
 
 
-async def validate_jql(client: httpx.AsyncClient, profile: Profile, jql: str) -> str | None:
-    """Validate a JQL string against Jira's /jql/parse endpoint.
-
-    Sends the JQL to the Jira parse API before executing the search, allowing
-    invalid queries to be caught and logged cleanly instead of raising HTTP 400.
-    Validation is silently skipped if the endpoint is unavailable (e.g. older
-    Jira Server versions that do not expose /jql/parse).
-
-    Args:
-        client: An active httpx.AsyncClient with Jira credentials configured.
-        profile: The active Profile providing the Jira base URL.
-        jql: The JQL string to validate.
-
-    Returns:
-        str | None: The first JQL error message if invalid, None if valid or
-        if the parse endpoint is unavailable.
-    """
-    response = await client.post(
-        f"{profile.jira_base_url}/rest/api/2/jql/parse",
-        json={"queries": [jql]},
-    )
-    if not response.is_success:
-        logger.warning("JQL validation endpoint unavailable (HTTP %d) — skipping", response.status_code)
-        return None
-    errors = response.json().get("queries", [{}])[0].get("errors", [])
-    return errors[0] if errors else None
-
 
 import re as _re
 
@@ -419,12 +392,6 @@ async def atlasmind(
     headers = {"Accept": "application/json", "Content-Type": "application/json"}
 
     async with httpx.AsyncClient(auth=auth, headers=headers) as client:
-        error = await validate_jql(client, profile, jql_query)
-        if error:
-            logger.error("Invalid JQL: %s", error)
-            logger.error("JQL was: %s", jql_query)
-            return None
-
         if profile.is_cloud:
             response = await client.post(
                 f"{profile.jira_base_url}/rest/api/3/search/jql",
@@ -451,7 +418,7 @@ async def atlasmind(
     if post_filters:
         issues, examined = _apply_post_filters(issues, post_filters, max_results)
 
-    # ── Extract display values using FIELD_META extractors ──────────
+    # -- Extract display values using FIELD_META extractors ----------
     result_issues = []
     for issue in issues:
         row: dict = {"key": issue["key"]}

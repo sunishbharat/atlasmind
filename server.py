@@ -43,7 +43,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ── Startup state (shared across requests) ───────────────────────────
+# -- Startup state (shared across requests) ---------------------------
 _state: dict = {}
 
 
@@ -59,7 +59,41 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="AtlasMind", lifespan=lifespan)
 
 
-# ── Query endpoint ───────────────────────────────────────────────────
+# -- Response builder -------------------------------------------------
+
+def _build_response(profile, response_type: str, answer: str | None = None, jira_result: dict | None = None) -> dict:
+    """Build a uniform JSON response for both general and JQL query results.
+
+    Args:
+        profile:       Active Profile object (supplies name and jira_base_url).
+        response_type: "general" for plain-text answers, "jql" for Jira results.
+        answer:        Plain-text answer; required when response_type is "general".
+        jira_result:   Dict returned by atlasmind(); required when response_type is "jql".
+
+    Returns:
+        dict with a consistent shape regardless of response_type.
+    """
+    base = {
+        "type":          response_type,
+        "profile":       profile.name,
+        "jira_base_url": profile.jira_base_url,
+        "jql":           None,
+        "total":         0,
+        "shown":         0,
+        "examined":      0,
+        "post_filters":  [],
+        "display_fields": [],
+        "issues":        [],
+        "answer":        None,
+    }
+    if response_type == "general":
+        base["answer"] = answer
+    else:
+        base.update(jira_result)
+    return base
+
+
+# -- Query endpoint ---------------------------------------------------
 
 @app.get("/query")
 async def query(
@@ -77,8 +111,13 @@ async def query(
     if model is None:
         raise HTTPException(status_code=503, detail="Model not initialised.")
 
-    jql = await generate_jql(q, model)
-    jql, jql_limit = _sanitize_jql(jql)
+    response_text, is_general = await generate_jql(q, model)
+
+    # if response/query is not JQL
+    if is_general:
+        return _build_response(active_profile, "general", answer=response_text)
+
+    jql, jql_limit = _sanitize_jql(response_text)
     logger.info("Generated JQL : %s", jql)
 
     max_results  = limit or jql_limit or _parse_limit(q) or MAX_RESULTS
@@ -115,4 +154,4 @@ async def query(
     if result is None:
         raise HTTPException(status_code=400, detail=f"JQL query failed: {jql}")
 
-    return result
+    return _build_response(active_profile, "jql", jira_result=result)

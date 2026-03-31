@@ -20,7 +20,7 @@ Adding a custom field example:
 import re as _re
 from datetime import datetime
 
-# ── Date helpers (used by computed fields below) ─────────────────────
+# -- Date helpers (used by computed fields below) ---------------------
 
 def _parse_jira_dt(value: str | None) -> datetime | None:
     """Parse an ISO 8601 datetime string from a Jira field value.
@@ -51,7 +51,7 @@ def _days_to_fix(f: dict) -> str:
     return ""
 
 
-# ── 1. Field metadata ─────────────────────────────────────────────────
+# -- 1. Field metadata -------------------------------------------------
 #
 # Format:  "jira_api_field_name": ("Display Label", column_width, extractor_fn)
 #
@@ -77,10 +77,10 @@ FIELD_META: dict[str, tuple[str, int, callable]] = {
     "fixVersions"   : ("Fix Version",  14, lambda f: ", ".join(v["name"] for v in f.get("fixVersions", []))),
     "labels"        : ("Labels",       20, lambda f: ", ".join(f.get("labels", []))),
     "description"   : ("Description",  40, lambda f: ((f.get("description") or "")[:38] + "..") if len(f.get("description") or "") > 40 else (f.get("description") or "")),
-    # ── Computed fields ───────────────────────────────────────────────
+    # -- Computed fields -----------------------------------------------
     # These are calculated locally; their dependencies are auto-fetched.
     "days_to_fix"   : ("Days To Fix",  12, _days_to_fix),
-    # ── Custom fields ─────────────────────────────────────────────────
+    # -- Custom fields -------------------------------------------------
     # Uncomment and adjust for your Jira instance, e.g.:
     # "customfield_10020": ("Sprint",  20, lambda f: (f.get("customfield_10020") or [{}])[-1].get("name", "")),
     # "customfield_10016": ("Story Pts", 8, lambda f: str(f.get("customfield_10016") or "")),
@@ -93,7 +93,7 @@ COMPUTED_FIELD_DEPS: dict[str, list[str]] = {
 }
 
 
-# ── 2. Default display fields ─────────────────────────────────────────
+# -- 2. Default display fields -----------------------------------------
 #
 # Shown when the user's query doesn't mention any specific fields.
 # Must be keys from FIELD_META above.
@@ -101,7 +101,7 @@ COMPUTED_FIELD_DEPS: dict[str, list[str]] = {
 DEFAULT_DISPLAY_FIELDS: list[str] = ["status", "assignee", "created"]
 
 
-# ── 3. Query field map ────────────────────────────────────────────────
+# -- 3. Query field map ------------------------------------------------
 #
 # Maps regex patterns (matched against the user's natural language query)
 # to Jira API field names.  Checked in order — first match wins per field.
@@ -126,13 +126,13 @@ QUERY_FIELD_MAP: list[tuple[str, str]] = [
     (r'\bfix\s*version\b|\bfixversion\b',                                                     "fixVersions"),
     (r'\blabel\b',                                                                            "labels"),
     (r'\bdescription\b',                                                                      "description"),
-    # ── Add custom field patterns below ───────────────────────────────
+    # -- Add custom field patterns below -------------------------------
     # (r'\bsprint\b',   "customfield_10020"),
     # (r'\bstory\s*points?\b|\bsp\b',  "customfield_10016"),
 ]
 
 
-# ── 4. Field aliases (JQL validator auto-correction) ─────────────────
+# -- 4. Field aliases (JQL validator auto-correction) -----------------
 #
 # Maps regex patterns of invalid field names the LLM tends to generate
 # → the correct Jira JQL field name.
@@ -149,12 +149,12 @@ FIELD_ALIASES: dict[str, str] = {
     r'\bmodified\b'     : 'updated',
     r'\blast_updated\b' : 'updated',
     r'\btype\b(?=\s*(?:=|!=|in\b|not\b))': 'issuetype',
-    # ── Add project-specific aliases below ────────────────────────────
+    # -- Add project-specific aliases below ----------------------------
     # r'\bresolutionDate\b': 'resolutiondate',
 }
 
 
-# ── 5. Post-processing filters ────────────────────────────────────────
+# -- 5. Post-processing filters ----------------------------------------
 #
 # Constraints that JQL cannot express (e.g. date arithmetic between two fields)
 # are detected from the NL query and applied in Python after fetching from Jira.
@@ -193,5 +193,5 @@ POST_FILTER_PATTERNS: list[tuple] = [
     # "took at most N days/weeks/months"
     (_re.compile(r'\btook?\s+at\s+most\s+(\d+)\s*(day|week|month)s?\b', _re.IGNORECASE),
      "days_to_fix", "<=", {"day": 1, "week": 7, "month": 30}),
-    # ── Add custom post-filter patterns below ─────────────────────────
+    # -- Add custom post-filter patterns below -------------------------
 ]
