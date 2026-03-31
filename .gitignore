@@ -211,6 +211,7 @@ __marimo__/
 *.md
 !README.md
 !data/jira-jql-annotated-queries.md
+!src/system_prompt.md
 
 # Atlassian credentials
 profiles.json
