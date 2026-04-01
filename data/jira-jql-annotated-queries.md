@@ -1319,3 +1319,28 @@ project IN (ZOOKEEPER, HIVE) ORDER BY created DESC
 
 /* 418. Open issues from ZOOKEEPER and HIVE, sorted by project then key */
 project IN (ZOOKEEPER, HIVE) AND resolution IS EMPTY ORDER BY project, key
+
+/* 419. Stories blocked by open bugs in core platform projects */ issueFunction in linkedIssuesOf("project in (HIVE, KAFKA, ZOOKEEPER) AND issuetype = Bug AND status in (\"In Progress\", \"Open\")", "blocks") AND issuetype in (Story, Task) ORDER BY priority DESC, updated DESC
+
+/* 420. Dependency chain up to 3 levels deep for a given release epic */ issueFunction in linkedIssuesOfRecursiveLimited("issue = HIVE-123 AND issuetype = Epic", 3, "is blocked by") ORDER BY project, issuetype, key
+
+/* 421. Cross-project dependencies into HIVE from KAFKA and ZOOKEEPER */ project = HIVE AND issueFunction in linkedIssuesOf("project in (KAFKA, ZOOKEEPER) AND statusCategory != Done", "is blocked by") ORDER BY statusCategory, updated DESC
+
+/* 422. Open issues that block at least one unresolved issue in any of the three projects */ issueFunction in linkedIssuesOf("project in (HIVE, KAFKA, ZOOKEEPER) AND resolution IS EMPTY", "is blocked by") AND resolution IS EMPTY ORDER BY priority DESC, created ASC
+
+/* 423. All issues within 2-link distance of a critical production incident */ issueFunction in linkedIssuesOfRecursiveLimited("issue = KAFKA-999 AND priority = Highest", 2) ORDER BY project, priority DESC, updated DESC
+
+/* 424. Epics/Features that have at least one linked Story/Task/Sub-task */
+issuetype in (Epic, Feature) AND issueFunction in linkedIssuesOf("issuetype in (Story, Task, Sub-task)", "has Epic") ORDER BY updated DESC
+
+/* 425. Stories/Tasks that are not linked to any Epic/Feature (broken hierarchy) */ 
+issuetype in (Story, Task) AND issueFunction not in linkedIssuesOf("issuetype in (Epic, Feature)", "has Epic") ORDER BY created DESC
+
+/* 426. Sub-tasks whose parent Story/Task belongs to a specific Epic/Feature */ 
+issuetype = Sub-task AND issueFunction in linkedIssuesOfRecursiveLimited("issue = HIVE-123 AND issuetype in (Epic, Feature)", 2) ORDER BY priority DESC, updated DESC
+
+/* 427. All Stories/Tasks/Sub-tasks under Epics/Features in HIVE, KAFKA, ZOOKEEPER */ 
+issuetype in (Story, Task, Sub-task) AND issueFunction in linkedIssuesOfRecursiveLimited("project in (HIVE, KAFKA, ZOOKEEPER) AND issuetype in (Epic, Feature)", 2) ORDER BY project, issuetype, key
+
+/* 428. Epics/Features that have at least one blocked Story/Task/Sub-task */ 
+issuetype in (Epic, Feature) AND issueFunction in linkedIssuesOfRecursiveLimited("issuetype in (Story, Task, Sub-task) AND status in (\"Blocked\", \"On Hold\")", 2) ORDER BY priority DESC, updated DESC
