@@ -15,6 +15,7 @@ Run with --help for full CLI usage.
 
 import argparse
 import asyncio
+import json
 import logging
 import os
 import re
@@ -120,12 +121,12 @@ def _build_prompt(query: str, examples: list[tuple]) -> str:
         f"-- {annotation}\n{jql}"
         for _, annotation, jql, _ in examples
     )
-    system_prompt = load_prompt("./src/system_prompt.md")   
+    system_prompt = load_prompt("./src/system_prompt.md")
     return (
-        str(system_prompt) + 
-        f"\n\nFor Jira JQL queries. Use the examples below as references. "
-        f"Each example is in the format '-- <annotation>\\n<jql>'. "
-        f"Generate a single valid JQL statement for the user's request using these rules:\n"
+        str(system_prompt) +
+        f"\n\nUse the JQL examples below as references. "
+        f"Each example is in the format '-- <annotation>\\n<jql>'.\n"
+        f"JQL rules:\n"
         f"- Do not use placeholder values like 'ProjectName' or 'USERNAME'.\n"
         f"- If no specific project is mentioned, omit the project filter.\n"
         f"- Do NOT use date arithmetic between two fields. JQL does not support this.\n"
@@ -133,40 +134,34 @@ def _build_prompt(query: str, examples: list[tuple]) -> str:
         f"  INVALID: resolutiondate - created > 20d\n"
         f"  CORRECT: project = ZOOKEEPER AND resolution IS NOT EMPTY ORDER BY resolutiondate DESC\n"
         f"  (duration filtering like 'took more than N days' is handled separately — omit it from JQL)\n"
-        f"- Do NOT append LIMIT — result count is controlled externally.\n"
-        f"- Output only the JQL — no explanation, no markdown, no comments.\n\n"
+        f"- Do NOT append LIMIT — result count is controlled externally.\n\n"
         f"Examples:\n{example_block}\n\n"
         f"User request: {query}\n"
-        f"JQL:"
+        f"JSON:"
     )
 
 
-_JQL_TAG = "<<JQL>>"
-
-
-async def generate_jql(query: str, model: SentenceTransformer) -> tuple[str, bool]:
-    """Generate a JQL string (or general answer) from a natural language query using RAG + Ollama.
+async def generate_jql(query: str, model: SentenceTransformer) -> dict:
+    """Generate a structured LLM response from a natural language query using RAG + Ollama.
 
     Retrieves the top-5 most semantically similar (annotation, JQL) pairs from
     pgvector, builds a few-shot prompt, and sends it to the local Ollama LLM.
 
-    The system prompt instructs Ollama to prefix JQL responses with ``<<JQL>>``.
-    If the response starts with that tag the tag is stripped and ``is_general``
-    is False.  Any other response is treated as a plain-text general answer and
-    ``is_general`` is True — the caller should display it directly without
-    hitting the Jira REST API.
+    The LLM returns JSON with keys: ``jql``, ``chart_spec``, ``answer``.
+    For general (non-Jira) queries ``jql`` and ``chart_spec`` are null.
 
     Args:
         query: The user's natural language query string.
         model: SentenceTransformer model used to encode the query for similarity search.
 
     Returns:
-        tuple[str, bool]: ``(text, is_general)`` — *text* is either a raw JQL
-        string or a plain-text answer; *is_general* is True for non-JQL responses.
+        dict with keys:
+            - ``jql``        (str | None)  — JQL string, or None for general queries.
+            - ``chart_spec`` (dict | None) — chart visualisation spec, or None.
+            - ``answer``     (str)         — human-readable description or general answer.
 
     Raises:
-        RuntimeError: If pgvector returns no examples (DB not loaded).
-        httpx.HTTPStatusError: If the Ollama API request fails.
+        RuntimeError: If pgvector returns no examples (DB not loaded) or Ollama unreachable.
     """
     examples, _ = test_embeddings_jql(query, model)
     if not examples:
@@ -192,12 +187,21 @@ async def generate_jql(query: str, model: SentenceTransformer) -> tuple[str, boo
     # Strip any accidental markdown fences
     text = re.sub(r"^```[a-z]*\n?", "", text, flags=re.IGNORECASE).strip("`").strip()
 
-    if text.startswith(_JQL_TAG):
-        return text[len(_JQL_TAG):].strip(), False
+    try:
+        result = json.loads(text)
+        if "jql" not in result:
+            raise ValueError("missing 'jql' key")
+    except (json.JSONDecodeError, ValueError):
+        logger.warning("LLM response was not valid JSON — treating as general answer.")
+        return {"jql": None, "chart_spec": None, "answer": text}
 
-    logger.info("Non-JQL query detected — returning general answer without Jira REST API call.")
-    logger.info("Response: %s", text)
-    return text, True
+    if not result.get("jql"):
+        logger.info("Non-JQL query detected — returning general answer without Jira REST API call.")
+    return {
+        "jql":        result.get("jql") or None,
+        "chart_spec": result.get("chart_spec"),
+        "answer":     result.get("answer", ""),
+    }
 
 
 def _remove_field_arithmetic(jql: str) -> str:
@@ -520,11 +524,11 @@ def main():
 
     # -- 2. Generate JQL via similarity search + Ollama ---------------
     logger.info("Query   : %s", args.query)
-    response_text, is_general = asyncio.run(generate_jql(args.query, model))
-    if is_general:
-        print(response_text)
+    llm_result = asyncio.run(generate_jql(args.query, model))
+    if not llm_result["jql"]:
+        print(llm_result["answer"])
         return
-    jql, jql_limit = _sanitize_jql(response_text)
+    jql, jql_limit = _sanitize_jql(llm_result["jql"])
     logger.info("Generated JQL : %s", jql)
 
     # -- 3. Run JQL against Jira --------------------------------------

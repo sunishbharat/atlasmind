@@ -15,7 +15,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from main import _remove_field_arithmetic, _sanitize_jql, _detect_post_filters, _parse_limit, _JQL_TAG, generate_jql
+from main import _remove_field_arithmetic, _sanitize_jql, _detect_post_filters, _parse_limit, generate_jql
 
 
 # -- 1. Field arithmetic removal ---------------------------------------
@@ -128,10 +128,11 @@ class TestPostFilterAndLimit:
 # -- 4. Non-JQL (general) query routing --------------------------------
 
 import asyncio
+import json
 
 class TestNonJqlRouting:
-    """When Ollama responds without the <<JQL>> prefix, generate_jql must
-    return is_general=True and the caller must skip the Jira REST API."""
+    """When Ollama returns jql=null, generate_jql must return jql=None (general mode).
+    When Ollama returns a JQL string, generate_jql must return it under the 'jql' key."""
 
     def _make_client_mock(self, ollama_answer: str):
         """Build a mocked httpx.AsyncClient that returns ollama_answer from POST."""
@@ -145,28 +146,32 @@ class TestNonJqlRouting:
         mock_client.post = AsyncMock(return_value=mock_response)
         return mock_client
 
-    def test_general_query_returns_is_general_true(self):
-        """A greeting response from Ollama (no <<JQL>> prefix) must set is_general=True."""
-        ollama_answer = "Hello! I am doing well, thank you for asking."
+    def test_general_query_returns_jql_none(self):
+        """A general response from Ollama (jql=null) must return jql=None."""
+        ollama_answer = json.dumps({"jql": None, "chart_spec": None, "answer": "Hello! I am doing well, thank you for asking."})
         mock_examples = [(1, "some annotation", "project = FOO", 0.5)]
 
         with patch("main.test_embeddings_jql", return_value=(mock_examples, None)), \
              patch("httpx.AsyncClient", return_value=self._make_client_mock(ollama_answer)):
-            text, is_general = asyncio.run(generate_jql("How are you?", model=MagicMock()))
+            result = asyncio.run(generate_jql("How are you?", model=MagicMock()))
 
-        assert is_general is True
-        assert _JQL_TAG not in text
-        assert text == ollama_answer
+        assert result["jql"] is None
+        assert result["answer"] == "Hello! I am doing well, thank you for asking."
 
-    def test_jql_query_returns_is_general_false(self):
-        """A JQL response from Ollama (with <<JQL>> prefix) must set is_general=False and strip the tag."""
+    def test_jql_query_returns_jql_string(self):
+        """A JQL response from Ollama must return the JQL string under the 'jql' key."""
         jql = "project = HADOOP AND status = Open ORDER BY created DESC"
-        ollama_answer = f"{_JQL_TAG}{jql}"
+        ollama_answer = json.dumps({
+            "jql": jql,
+            "chart_spec": {"type": "bar", "x_field": "status", "y_field": "count", "title": "Issues by status"},
+            "answer": "Top open issues in HADOOP ordered by creation date.",
+        })
         mock_examples = [(1, "some annotation", jql, 0.3)]
 
         with patch("main.test_embeddings_jql", return_value=(mock_examples, None)), \
              patch("httpx.AsyncClient", return_value=self._make_client_mock(ollama_answer)):
-            text, is_general = asyncio.run(generate_jql("list open issues in HADOOP", model=MagicMock()))
+            result = asyncio.run(generate_jql("list open issues in HADOOP", model=MagicMock()))
 
-        assert is_general is False
-        assert text == jql
+        assert result["jql"] == jql
+        assert result["chart_spec"] is not None
+        assert result["answer"] != ""

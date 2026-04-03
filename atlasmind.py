@@ -288,6 +288,44 @@ def _apply_post_filters(issues: list, filters: list, limit: int) -> tuple[list, 
 
 import re as _re
 
+
+# -- Issue normalizer ------------------------------------------------
+
+def _extract_sprint_name(fields: dict) -> str | None:
+    """Return the name of the most recent sprint from Jira sprint custom field."""
+    sprints = fields.get("customfield_10020") or []
+    if sprints and isinstance(sprints, list):
+        return sprints[-1].get("name")
+    return None
+
+
+def normalize_issue(jira_issue: dict) -> dict:
+    """Flatten a raw Jira API issue into a snake_case dict for the frontend.
+
+    Args:
+        jira_issue: Raw issue dict from the Jira REST API response (with nested ``fields``).
+
+    Returns:
+        Flat dict with snake_case keys expected by the frontend ApiIssue type.
+    """
+    fields = jira_issue.get("fields", {})
+    return {
+        "key":          jira_issue.get("key"),
+        "summary":      fields.get("summary"),
+        "status":       (fields.get("status") or {}).get("name"),
+        "issuetype":    (fields.get("issuetype") or {}).get("name"),
+        "priority":     (fields.get("priority") or {}).get("name"),
+        "assignee":     (fields.get("assignee") or {}).get("displayName"),
+        "reporter":     (fields.get("reporter") or {}).get("displayName"),
+        "story_points": fields.get("story_points") or fields.get("customfield_10016"),
+        "epic_link":    fields.get("customfield_10014"),
+        "parent":       (fields.get("parent") or {}).get("key"),
+        "sprint":       _extract_sprint_name(fields),
+        "created":      fields.get("created"),
+        "updated":      fields.get("updated"),
+        "labels":       fields.get("labels", []),
+    }
+
 def _replace_project_clause(jql: str, project: str) -> str:
     """Replace 'project IN (...)' or 'project = X' with 'project = <project>'."""
     jql = _re.sub(r'\bproject\s+IN\s*\([^)]+\)', f'project = {project}', jql, flags=_re.IGNORECASE)
@@ -440,6 +478,7 @@ async def atlasmind(
         "post_filters":  pf_descs,
         "display_fields": display_fields,
         "issues":        result_issues,
+        "raw_issues":    issues,       # raw Jira API dicts for normalize_issue()
     }
 
 
