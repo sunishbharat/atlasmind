@@ -22,10 +22,12 @@ import sys
 from pathlib import Path
 from typing import NamedTuple
 
+import psycopg2
+
 import httpx
 from sentence_transformers import SentenceTransformer
 
-from atlasmind import atlasmind, atlasmind_multi_project, MAX_RESULTS
+from atlasmind import atlasmind, atlasmind_multi_project, MAX_RESULTS, check_rovo_mcp
 from config import get_profile, print_profiles
 from config_fields import (
     DEFAULT_DISPLAY_FIELDS, FIELD_META, QUERY_FIELD_MAP,
@@ -75,7 +77,17 @@ def load_annotations_into_db(annotation_file: str) -> SentenceTransformer:
         raise FileNotFoundError(f"Annotation file not found: {path}")
     pairs = parse_jql_annotations(str(path))
     logger.info("Loaded %d annotation pairs from %s", len(pairs), path.name)
-    model = update_pgvector_from_annotations(pairs)
+    try:
+        model = update_pgvector_from_annotations(pairs)
+    except psycopg2.OperationalError as exc:
+        logger.error("Failed to connect to pgvector database: %s", exc)
+        logger.error(
+            "Database may not exist. Run the following commands to create it:(update password if different)\n\n"
+            "  set PGPASSWORD=postgres\n"
+            '  psql -h localhost -p 5432 -U postgres -c "CREATE DATABASE jql_vectordb;"\n'
+            "  set PGPASSWORD=\n"
+        )
+        raise
     return model
 
 
@@ -163,13 +175,19 @@ async def generate_jql(query: str, model: SentenceTransformer) -> tuple[str, boo
     prompt = _build_prompt(query, examples)
     logger.debug("Ollama prompt:\n%s", prompt)
 
-    async with httpx.AsyncClient(timeout=60) as client:
-        response = await client.post(
-            f"{OLLAMA_URL}/api/generate",
-            json={"model": OLLAMA_MODEL, "prompt": prompt, "stream": False, "options": {"temperature": OLLAMA_TEMPERATURE}},
+    try:
+        async with httpx.AsyncClient(timeout=60) as client:
+            response = await client.post(
+                f"{OLLAMA_URL}/api/generate",
+                json={"model": OLLAMA_MODEL, "prompt": prompt, "stream": False, "options": {"temperature": OLLAMA_TEMPERATURE}},
+            )
+            response.raise_for_status()
+            text = response.json()["response"].strip()
+    except httpx.ConnectError:
+        raise RuntimeError(
+            f"Cannot connect to Ollama at {OLLAMA_URL}. "
+            "Ensure Ollama is running: ollama serve"
         )
-        response.raise_for_status()
-        text = response.json()["response"].strip()
 
     # Strip any accidental markdown fences
     text = re.sub(r"^```[a-z]*\n?", "", text, flags=re.IGNORECASE).strip("`").strip()
@@ -442,6 +460,10 @@ examples:
         help="Start AtlasMind as a FastAPI HTTP server instead of running a single query.",
     )
     parser.add_argument(
+        "--check-mcp", action="store_true",
+        help="Check connectivity to the Atlassian Rovo MCP server and list available tools.",
+    )
+    parser.add_argument(
         "--host", default="0.0.0.0", metavar="HOST",
         help="Host to bind the server to (default: 0.0.0.0). Only used with --server.",
     )
@@ -473,6 +495,13 @@ def main():
 
     if args.list_profiles:
         print_profiles()
+        return
+
+    if args.check_mcp:
+        profile = get_profile(args.profile)
+        logger.info("Profile : %s", profile.name)
+        logger.info("Jira URL: %s", profile.jira_base_url)
+        asyncio.run(check_rovo_mcp(profile))
         return
 
     if args.server:

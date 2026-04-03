@@ -107,7 +107,7 @@ def get_profile(name: str | None = None) -> Profile:
     token = (
         raw.get("token")
         or os.getenv(f"ATLASMIND_{resolved.upper()}_TOKEN")
-        or os.getenv("ATLASSIAN_TOKEN")
+        or os.getenv("ATLASSIAN_API_TOKEN")
         or ""
     )
 
